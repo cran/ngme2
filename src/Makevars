@@ -1,0 +1,49 @@
+$(SHLIB): $(OBJECTS)
+
+ssdir = SuiteSparse
+sslib1 = $(ssdir)/CHOLMOD/CHOLMOD.a
+sslib2 = $(ssdir)/CCOLAMD/CCOLAMD.a
+sslib3 = $(ssdir)/CAMD/CAMD.a
+sslib4 = $(ssdir)/COLAMD/COLAMD.a
+sslib5 = $(ssdir)/AMD/AMD.a
+sslib7 = $(ssdir)/SuiteSparse_config/SuiteSparse_config.a
+sslib = $(sslib1) $(sslib2) $(sslib3) $(sslib4) $(sslib5) $(sslib7)
+
+ssenv = \
+	CC="$(CC)" \
+	CPPFLAGS="$(CPPFLAGS) -I\"$(R_INCLUDE_DIR)\" -DNDEBUG -DNPRINT -DNTIMER -DNPARTITION" \
+	CFLAGS="$(CFLAGS) $(CPICFLAGS) $(C_VISIBILITY)" \
+	AR="$(AR)" \
+	RANLIB="$(RANLIB)"
+
+PKG_CPPFLAGS = -I"$(ssdir)/SuiteSparse_config" -DNDEBUG -DEIGEN_NO_DEBUG -Iinclude -I../inst/include
+PKG_CFLAGS = $(C_VISIBILITY)
+PKG_LIBS = $(sslib) $(LAPACK_LIBS) $(BLAS_LIBS) $(FLIBS)
+
+$(sslib1):
+	cd SuiteSparse/CHOLMOD && $(MAKE) clean all $(ssenv)
+
+$(sslib2):
+	cd SuiteSparse/CCOLAMD && $(MAKE) clean all $(ssenv)
+
+$(sslib3):
+	cd SuiteSparse/CAMD && $(MAKE) clean all $(ssenv)
+
+$(sslib4):
+	cd SuiteSparse/COLAMD && $(MAKE) clean all $(ssenv)
+
+$(sslib5):
+	cd SuiteSparse/AMD && $(MAKE) clean all $(ssenv)
+
+$(sslib7):
+	cd SuiteSparse/SuiteSparse_config && $(MAKE) clean all $(ssenv)
+
+UTILS = util/GIG.o util/rgig.o util/MatrixAlgebra.o util/solver.o
+LATENTS = latents/ou.o latents/matern.o latents/tensorprod.o latents/randeff.o latents/bivar.o latents/generic.o latents/generic_ns.o latents/arma.o latents/rcallback.o latents/fractional/fractional_operators.o
+
+OBJECTS = $(sslib) RcppExports.o prior.o noise.o sample_rGIG.o estimate.o optimizer.o block.o latent.o ngme.o loglikelihood.o operator.o $(UTILS) $(TESTS) $(LATENTS)
+
+clean:
+	@rm -f *.o util/*.o latents/*.o
+
+.PHONY: clean
