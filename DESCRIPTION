@@ -1,7 +1,7 @@
 Package: ngme2
 Type: Package
 Title: Linear Latent Non-Gaussian Models with Flexible Distributions
-Version: 0.9.7
+Version: 0.9.8
 Authors@R: c(
     person("David", "Bolin", email = "davidbolin@gmail.com", role = c("aut", "cph")),
     person("Xiaotian", "Jin", email = "xiaotian.jin@kaust.edu.sa", role =c("aut", "cre")),
@@ -60,7 +60,7 @@ Copyright: The R package and code, and the main programs, were written
         bundled SuiteSparse components. For details see
         inst/COPYRIGHTS.
 NeedsCompilation: yes
-Packaged: 2026-04-24 05:03:15 UTC; jinx0a
+Packaged: 2026-05-19 19:01:57 UTC; jinx0a
 Author: David Bolin [aut, cph],
   Xiaotian Jin [aut, cre],
   Alexandre Simas [aut],
@@ -87,4 +87,4 @@ Author: David Bolin [aut, cph],
   Alexander Chemeris [ctb, cph] (MS integer headers bundled with
     SuiteSparse)
 Repository: CRAN
-Date/Publication: 2026-04-28 18:50:08 UTC
+Date/Publication: 2026-05-20 07:40:02 UTC
