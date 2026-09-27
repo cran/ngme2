@@ -23,10 +23,13 @@ test_that("generic model == AR1 model", {
   ar1$param_name
   ar1$param_trans
 
+  # K = rho C + G + sqrt(1 - rho^2) E11: the last term is the stationary
+  # initial condition, which has to travel as its own matrix because the
+  # coefficient is not linear in theta_K.
   generic_ar1 <- generic(
     theta_K = c(x = g(0.5)), # trans(X) = rho
-    trans = c(x = "tanh"),
-    matrices = list(ar1$C, ar1$G),
+    trans = list(x = c("tanh", "null", "sech")),
+    matrices = list(ar1$C, ar1$G, ar1$E11),
     h = ar1$h,
     mesh = 1:n_obs
   )
@@ -34,11 +37,12 @@ test_that("generic model == AR1 model", {
   generic_ar1$param_name
   generic_ar1$param_trans
 
-  expect_equal(ar1$K, ar1$C * 0.5 + ar1$G)
+  expect_equal(ar1$K, ar1$C * 0.5 + ar1$G + sqrt(1 - 0.5^2) * ar1$E11)
   expect_equal(generic_ar1$K, ar1$K)
-  expect_equal(generic_ar1$matrices, list(ar1$C, ar1$G))
+  expect_equal(generic_ar1$matrices, list(ar1$C, ar1$G, ar1$E11))
 
   control <- control_opt(
+    warn_no_convergence = FALSE,
     seed = seed,
     iterations = 100,
     n_parallel_chain = 4,
@@ -56,7 +60,10 @@ test_that("generic model == AR1 model", {
   )
   fit_ar1
 
-  est_rho_ar1 <- ar1_th2a(ngme_result(fit_ar1, "my_ar")$rho)
+  # ngme_result() reports each parameter through the operator's own
+  # param_trans, which for ar1 is ar1_th2a: rho is already on the (-1, 1)
+  # scale here.
+  est_rho_ar1 <- ngme_result(fit_ar1, "my_ar")$rho
   print(est_rho_ar1)
   traceplot(fit_ar1, "my_ar")
 
@@ -67,8 +74,8 @@ test_that("generic model == AR1 model", {
       model = generic(
         mesh = 1:n_obs,
         theta_K = c(rho = g(0.5)),
-        trans = c(rho = "tanh"),
-        matrices = list(ar1$C, ar1$G),
+        trans = list(rho = c("tanh", "null", "sech")),
+        matrices = list(ar1$C, ar1$G, ar1$E11),
         h = ar1$h
       ),
     ),
@@ -77,6 +84,9 @@ test_that("generic model == AR1 model", {
   )
   fit_generic
 
+  # The generic operator spreads rho over two different transformations, so
+  # get_param_trans() falls back to the identity and ngme_result() reports the
+  # raw theta_K. Put it on the same scale as the ar1 estimate above.
   est_rho_generic <- ar1_th2a(ngme_result(fit_generic, "generic")$rho)
   print(est_rho_generic)
 
@@ -101,6 +111,7 @@ test_that("generic model == Matern model (alpha == 2)", {
 
   # Fitting the matern model
   control <- control_opt(
+    warn_no_convergence = FALSE,
     seed = 10,
     iterations = 10,
     n_parallel_chain = 4,
@@ -176,6 +187,7 @@ test_that("generic model == Matern model (alpha == 4)", {
 
   # Fitting the matern model
   control <- control_opt(
+    warn_no_convergence = FALSE,
     seed = 10,
     iterations = 100,
     n_parallel_chain = 4,
@@ -245,6 +257,7 @@ test_that("generic model == Matern model", {
   expect_equal(generic_matern$matrices, list(matern$C, matern$G))
 
   control <- control_opt(
+    warn_no_convergence = FALSE,
     seed = seed,
     iterations = 100,
     n_parallel_chain = 4,
@@ -302,6 +315,7 @@ test_that("generic model == RW1 model", {
   # expect_equal(generic_rw1$matrices, list(rw1$K))
 
   control <- control_opt(
+    warn_no_convergence = FALSE,
     seed = seed,
     iterations = 100,
     n_parallel_chain = 4,

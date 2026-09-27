@@ -26,6 +26,10 @@ private:
   double beta1{0.1}, beta2{0.99}, eps_hat{1e-8}, lambda{0.1};
   double sgld_temperature{1.0};
   VectorXd m, v; // momentum, velocity
+  double schedule_min_scale{0.0}; // floor under the decay schedule
+  int step_clip_mode{2};        // 0 = per-component, 1 = norm, 2 = adaptive
+  double step_clip_factor{5.0}; // adaptive: multiple of the recent step length
+  double step_scale{0.0};       // adaptive: running typical step length
 
   // store the preconditioner
   MatrixXd preconditioner;
@@ -52,10 +56,6 @@ private:
   int stepsize_schedule_burnin_iter{0};
   double last_grad_norm{0.0};
 
-  // Pflug diagnostic
-  bool pflug_conv_check{false};
-  double pflug_sum{0.0};
-  double max_pflug_sum{0.0};
   std::mt19937 sgld_rng;
   std::normal_distribution<double> sgld_std_normal{0.0, 1.0};
 
@@ -74,11 +74,14 @@ public:
   void set_verbose(bool value) { verbose = value; }
   bool is_verbose() const { return verbose; }
 
-  void set_pflug_conv_check(bool value) { pflug_conv_check = value; }
-  bool get_pflug_conv_check() const { return pflug_conv_check; }
-  double get_pflug_sum() const { return pflug_sum; }
-  double get_max_pflug_sum() const { return max_pflug_sum; }
   double get_last_grad_norm() const { return last_grad_norm; }
+  void set_stepsize_decay_enabled(bool value) { stepsize_decay_enabled = value; }
+  // Start the step-size schedule HERE rather than at a preset iteration.
+  // Where the transient ends is a property of the problem, not something a
+  // caller can know in advance, so the schedule is armed by the convergence
+  // machinery at the first checkpoint where the drift test passes.
+  void set_schedule_burnin(int it) { stepsize_schedule_burnin_iter = it; }
+  double get_stepsize_decay_scale() const { return stepsize_decay_scale; }
   void set_stepsize_decay_scale(double scale) {
     stepsize_decay_scale = scale;
     if (stepsize_decay_min_stepsize > 0.0 &&

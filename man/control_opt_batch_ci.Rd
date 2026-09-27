@@ -8,7 +8,7 @@ control_opt_batch_ci(
   optimizer = sgd(stepsize = 0.03),
   burnin = 100,
   iterations = 2000,
-  n_batch = 20,
+  iters_per_check = 100,
   n_parallel_chain = 4,
   alpha = 0.501,
   t0 = 1,
@@ -23,7 +23,7 @@ control_opt_batch_ci(
 
 \item{iterations}{optimization iterations.}
 
-\item{n_batch}{number of checkpoints.}
+\item{iters_per_check}{iterations between checkpoints (default 100).}
 
 \item{n_parallel_chain}{number of parallel chains.}
 
@@ -50,7 +50,6 @@ This helper enforces trajectory-friendly defaults:
   \item \code{store_traj = TRUE}
   \item \code{trend_std_conv_check = FALSE}
   \item \code{R_hat_conv_check = FALSE}
-  \item \code{pflug_conv_check = FALSE}
   \item \code{stepsize_control = poly_decay(alpha, t0, schedule_burnin_iter)}
 }
 Any of these can still be overridden through \code{...}.

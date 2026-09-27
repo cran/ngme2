@@ -3,7 +3,9 @@
 
 #include "include/timer.h"
 #include "optimizer.h"
+#include "include/thread_io.h"
 #include <sstream>
+#include <stdexcept>
 
 using Eigen::MatrixXd;
 using Eigen::VectorXd;
@@ -14,10 +16,22 @@ Ngme_optimizer::Ngme_optimizer(const Rcpp::List &control_opt,
                                unsigned long seed)
     : model(ngme), verbose(control_opt["verbose"]),
       numerical_eps(control_opt["numerical_eps"]), curr_iter(0),
-
       method(Rcpp::as<std::string>(control_opt["sgd_method"])),
       m(VectorXd::Zero(ngme->get_n_params())),
       v(VectorXd::Zero(ngme->get_n_params())),
+      schedule_min_scale(
+          control_opt.containsElementNamed("schedule_min_scale")
+              ? Rcpp::as<double>(control_opt["schedule_min_scale"])
+              : 0.0),
+      step_clip_mode(
+          control_opt.containsElementNamed("step_clip_mode")
+              ? Rcpp::as<int>(control_opt["step_clip_mode"])
+              : 2),
+      step_clip_factor(
+          control_opt.containsElementNamed("step_clip_factor")
+              ? Rcpp::as<double>(control_opt["step_clip_factor"])
+              : 5.0),
+
       preconditioner(
           MatrixXd::Identity(ngme->get_n_params(), ngme->get_n_params())),
       grad(VectorXd::Zero(ngme->get_n_params())), x(ngme->get_parameter()),
@@ -107,12 +121,7 @@ Ngme_optimizer::Ngme_optimizer(const Rcpp::List &control_opt,
 }
 
 void Ngme_optimizer::log_verbose_message(const std::string &msg) const {
-#ifdef _OPENMP
-#pragma omp critical(ngme_verbose_print)
-  { Rcpp::Rcout << msg; }
-#else
-  Rcpp::Rcout << msg;
-#endif
+  ngme_io::out() << msg;
 }
 
 // x <- x - model->stepsize() * model->grad()
@@ -144,13 +153,6 @@ VectorXd Ngme_optimizer::sgd(double eps, int iterations,
     }
 
     last_grad_norm = grad.norm();
-
-    // Pflug diagnostic
-    if (pflug_conv_check && curr_iter > 0) {
-      double inner_prod = grad.dot(prev_grad);
-      pflug_sum += inner_prod;
-      max_pflug_sum = std::max(max_pflug_sum, pflug_sum);
-    }
 
     // which SGD step
     // default: one step = stepsize * H^-1 * grad
@@ -254,9 +256,17 @@ VectorXd Ngme_optimizer::sgd(double eps, int iterations,
       } else {
         double local_iter =
             (curr_iter - stepsize_schedule_burnin_iter) + 1.0;
+        // NORMALISED so the scale is exactly 1 at the moment the schedule
+        // starts. The unnormalised form pow(local_iter + t0, -alpha) is 0.063
+        // at its very first step for t0 = 100, alpha = 0.6. In this form t0 is
+        // the timescale over which decay actually happens.
         stepsize_schedule_scale =
-            std::pow(local_iter + stepsize_schedule_t0,
+            std::pow(1.0 + local_iter / stepsize_schedule_t0,
                      -stepsize_schedule_alpha);
+        // FLOOR. An unbounded decay does not trade noise for precision, it
+        // switches the optimiser off.
+        if (stepsize_schedule_scale < schedule_min_scale)
+          stepsize_schedule_scale = schedule_min_scale;
       }
       one_step *= stepsize_schedule_scale;
       effective_stepsizes *= stepsize_schedule_scale;
@@ -267,32 +277,50 @@ VectorXd Ngme_optimizer::sgd(double eps, int iterations,
       effective_stepsizes *= stepsize_decay_scale;
     }
 
-    // Test if one_step is NAN
-    if (std::isnan(one_step(one_step.size() - 1))) {
+    // A failed chain must not contribute unchanged iterates to convergence
+    // diagnostics. Throw a C++ exception here: estimate.cpp catches it inside
+    // the parallel region and signals the R error after the workers join.
+    if (!one_step.allFinite()) {
       std::ostringstream oss;
-      oss << "grad.norm() = " << grad.norm() << '\n';
-      oss << " H = " << H << '\n';
-      oss << "one_step ISNAN = " << one_step << '\n';
-      log_verbose_message(oss.str());
-      return x;
+      oss << "Non-finite optimizer step at iteration " << curr_iter + 1
+          << ". Check starting values and the optimizer step size.";
+      throw std::runtime_error(oss.str());
     }
 
-    // std::cout << "get gradient (ms): " << since(timer_grad).count() <<
-    // std::endl; restrict one_step by |one_step(i)| / |x(i)| < rela_step
-    VectorXd rela_max_step = max_relative_step * x.cwiseAbs();
-    for (int j = 0; j < one_step.size(); j++) {
-      double sign = one_step(j) > 0 ? 1.0 : -1.0;
-
-      // // take limit on relative step
-      // if (abs(x(j)) > 1 && abs(one_step(j)) > rela_max_step(j)) {
-      //     one_step(j) = sign * rela_max_step(j);
-      // }
-
-      // take limit on absolute step
-      if (abs(one_step(j)) > max_absolute_step) {
-        one_step(j) = sign * max_absolute_step;
+    // ---- STEP LIMITING ------------------------------------------------------
+    //   "value"     historical: clip each component. Rotates the direction.
+    //   "norm"      rescale the whole vector if its length exceeds
+    //               max_absolute_step * sqrt(p) -- the length of a step sitting
+    //               at the component limit in every coordinate, so it binds in
+    //               the same place but preserves the direction.
+    //   "adaptive"  (default) rescale only steps that are far out of line with
+    //               the recent typical step length. Blow-ups are orders of
+    //               magnitude out and are caught; a step that is merely bigger
+    //               than usual, because the method accumulates one, is not.
+    //               A "norm" backstop still applies, so the scale cannot drift
+    //               up without bound.
+    const double p_dim = (double)one_step.size();
+    const double norm_cap = max_absolute_step * std::sqrt(p_dim);
+    if (step_clip_mode == 0) {
+      for (int j = 0; j < one_step.size(); j++) {
+        double sign = one_step(j) > 0 ? 1.0 : -1.0;
+        if (std::abs(one_step(j)) > max_absolute_step)
+          one_step(j) = sign * max_absolute_step;
       }
+    } else {
+      double nrm = one_step.norm();
+      double lim = norm_cap;
+      if (step_clip_mode == 2) {
+        if (!(step_scale > 0))
+          step_scale = nrm; // first step sets the reference
+        lim = std::min(norm_cap, step_clip_factor * step_scale);
+      }
+      if (nrm > lim && lim > 0)
+        one_step *= (lim / nrm);
+      if (step_clip_mode == 2)
+        step_scale = 0.95 * step_scale + 0.05 * one_step.norm();
     }
+    (void)max_relative_step;
 
     // variance reduction (not enabled)
     int r = curr_iter - var_reduce_iter;
@@ -336,10 +364,6 @@ VectorXd Ngme_optimizer::sgd(double eps, int iterations,
       }
       // oss << "parameter = : " << x << '\n';
       // oss << "marginal likelihood := " <<  -model->log_likelihood() << '\n';
-      if (pflug_conv_check) {
-        oss << "pflug_sum = " << pflug_sum
-            << ", max_pflug_sum = " << max_pflug_sum << '\n';
-      }
       oss << "---------------------------\n";
       log_verbose_message(oss.str());
     }

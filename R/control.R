@@ -6,15 +6,23 @@
 #' @details
 #' Convergence diagnostics (multi-chain):
 #' * R-hat: per-parameter Gelman–Rubin statistic; passes if \code{R_hat <= max_R_hat}.
-#' * Trend/Std: uses the last \code{n_slope_check} checkpoints after at least \code{n_min_batch} batches.
-#'   Passes when both the relative std (\code{sqrt(var)/|mean| <= std_lim}) and linear trend
-#'   of the means (\code{|slope| <= trend_lim}) satisfy their thresholds.
-#' * Pflug: per-chain criterion \code{pflug_sum < pflug_alpha * max_pflug_sum} in the latest batch;
-#'   if all chains satisfy it, overall convergence is declared.
-#' Checks are evaluated every \code{iters_per_check = iterations / n_batch}. A parameter is marked
-#' converged if any enabled parameter-level diagnostic (R-hat or Trend/Std) passes; the run stops
-#' when all parameters converge or when the Pflug diagnostic triggers.
-#' @param seed  set the seed for pesudo random number generator
+#' * Trend: fits a weighted linear trend over a window of \code{n_slope_check} points
+#'   and passes when the drift is slower than \code{trend_rel_lim}, as relative
+#'   movement per 100 iterations. This is scale-free and independent of
+#'   \code{n_batch}. \code{use_std_check = TRUE} additionally requires
+#'   \code{sqrt(var)/|mean| <= std_lim}.
+#'   The window points are sub-batch means spread evenly over the SECOND HALF of the run so
+#'   far, so the test is available from the first checkpoint and never regresses through the
+#'   optimiser's initial transient.
+#' Checks are evaluated every \code{iters_per_check} iterations. A parameter is marked
+#' converged only if every enabled parameter-level diagnostic (R-hat and Trend/Std) passes, so a
+#' single diagnostic cannot declare convergence on its own; the run stops when all parameters
+#' converge. Disable a diagnostic
+#' (\code{R_hat_conv_check = FALSE} or \code{trend_std_conv_check = FALSE}) to drop it from the
+#' requirement. The criteria must hold on \code{n_conv_batch} consecutive checkpoints, since a
+#' single passing checkpoint is weak evidence.
+#' @param seed  random seed. Defaults to a seed drawn from the current R
+#'   random number stream, so \code{set.seed()} makes the result reproducible.
 #' @param burnin          interations for burn-in periods (before optimization)
 #' @param iterations      optimization iterations
 #' @param estimation      run the estimation process (call C++ in backend)
@@ -23,16 +31,47 @@
 #'   any user-supplied \code{control_ngme(beta_init = ...)} is automatically
 #'   mapped from the original design scale to that standardized basis. Set to
 #'   \code{FALSE} to keep both the design matrix and any provided
-#'   \code{beta_init} on
-#'   their original scale.
+#'   \code{beta_init} on their original scale.
 #'
 #' @param n_parallel_chain number of parallel chains
-#' @param n_batch     number of checkpoints; optimization is split into \code{n_batch} equal batches
-#' @param iters_per_check run how many iterations between each check point (or specify \code{n_batch})
-#' @param n_min_batch   minimum number of checkpoints before any convergence diagnostic is attempted
+#' @param n_batch     \strong{Deprecated}; use \code{iters_per_check}. It set the
+#'   checkpoint interval as a division of the iteration budget, so raising
+#'   \code{iterations} silently checked less often.
+#' @param iters_per_check how many iterations between convergence checkpoints
+#'   (default 25). A fixed count, independent of \code{iterations}, which need
+#'   not be a multiple of it.
+#' @param n_min_batch   minimum number of checkpoints before any convergence
+#'   diagnostic is attempted (default 1).
 #' @param n_slope_check number of checkpoints used as the regression window for the trend test
+#' @param use_std_check include the relative-standard-deviation part of the trend/std
+#'   diagnostic. The raw coefficient of variation conflates chain disagreement with
+#'   parameter imprecision, so weakly identified parameters can never pass it.
+#' @param n_conv_batch number of consecutive checkpoints that must satisfy the criteria
+#'   before convergence is declared (default 2). Guards against a single lucky
+#'   checkpoint.
+#' @param schedule_auto_start arm the polynomial step-size schedule automatically
+#'   at the first checkpoint where the drift criterion passes. Defaults to FALSE.
+#' @param schedule_min_scale minimum multiplier allowed for the scheduled step size
+#'   (default 0.1).
+#' @param mc_se_conv_check use the Monte Carlo standard-error diagnostic as an
+#'   additional convergence condition during the search phase (default TRUE).
+#' @param max_stepsize_decays maximum number of precision-driven step-size reductions
+#'   (default 1).
+#' @param n_settle_checks number of checkpoints to wait after a step-size reduction
+#'   before assessing convergence again (default 3).
+#' @param stepsize_decay_precision_gamma factor by which to multiply the step size
+#'   at each precision-driven reduction (default 0.5).
+#' @param warn_no_convergence emit a warning when the iteration budget is exhausted without
+#'   the convergence criteria being met. Set \code{FALSE} for short runs where convergence
+#'   is not expected (e.g. fast unit tests).
 #' @param std_lim         maximum allowed standard deviation
-#' @param trend_lim       maximum allowed slope
+#' @param trend_lim reported in \code{attr(fit, "conv_diag")} as a reference
+#'   for the fitted slope's t-statistic; it no longer gates convergence.
+#' @param trend_rel_lim how fast a parameter must actually be MOVING before a
+#'   detectable drift counts as non-convergence, as a fraction of the parameter's
+#'   own scale per 100 iterations The default 0.01 reads as "1\% of itself per
+#'   100 iterations". A parameter fails the trend test only when its drift is
+#'   both statistically detectable and faster than this.
 #' @param print_check_info print the convergence information
 #' @param start deprecated guard argument. Do not pass model starts through
 #'   \code{control_opt()}; use \code{ngme(..., start = previous_fit)} instead.
@@ -43,13 +82,239 @@
 #'
 #' @param max_num_threads maximum number of threads used for parallel computing, by default will be set same as n_parallel_chain.
 #' If it is more than n_parallel_chain, the rest will be used to parallel different replicates of the model.
+#' @param step_clip how the per-iteration step is limited.
+#'   \describe{
+#'     \item{\code{"value"}}{the historical behaviour: clip each component at
+#'       \code{max_absolute_step}. Because components are truncated
+#'       independently, it rotates the search direction.}
+#'     \item{\code{"norm"}}{rescale the whole vector when its length exceeds
+#'       \code{max_absolute_step * sqrt(p)}.}
+#'     \item{\code{"adaptive"}}{the default: rescale only steps far out of line
+#'       with the recent typical step length (\code{step_clip_factor} times a
+#'       running average of it), with the \code{"norm"} cap as a backstop.
+#'       Blow-ups are orders of magnitude out and are caught; a step that is
+#'       merely larger than usual, because the method is accumulating one, is
+#'       not.}
+#'   }
+#' @param step_clip_factor for \code{step_clip = "adaptive"}, how many times the
+#'   recent typical step length is still considered a normal step.
 #' @param max_relative_step   max relative step allowed in 1 iteration
 #' @param max_absolute_step   max absolute step allowed in 1 iteration
 #' @param trend_std_conv_check enable the trend/std diagnostic (uses \code{std_lim}, \code{trend_lim}, \code{n_slope_check})
-#' @param solver_backend backend in ("eigen", "cholmod", "pardiso")
+#' @param solver_backend backend in ("eigen", "cholmod", "accelerate", "pardiso").
+#'   Defaults to "accelerate" on macOS and "cholmod" elsewhere.
+#'   Note that the speed of "cholmod" is set by the BLAS R itself is linked against,
+#'   and with R's bundled reference BLAS those kernels run one to two orders of
+#'   magnitude below a tuned one. Thus, link R against OpenBLAS or MKL before fitting
+#'   large models.
+#' @param solver_order fill-reducing ordering for the \code{"accelerate"}
+#'   backend. The ordering fixes the fill of the Cholesky factor and so the
+#'   cost of every factorization, which is the largest single item in a fit
+#'   with a high-dimensional latent field.
+#'   \code{"auto"} (default) analyzes the pattern under each candidate ordering
+#'   and keeps the one giving the smallest factor.
+#'   Its cost is a fixed amount of extra symbolic work at setup, so pass
+#'   \code{"default"} (leave Apple's choice, which is AMD) for a short fit.
+#'   \code{"amd"} and \code{"metis"} (nested dissection) force one ordering.
+#' @param trace_block_probe estimate the operator-side traces of a non-separable
+#'   spacetime model with structured probes rather than a dense inverse of each
+#'   spatial block. Default \code{FALSE}.
 #' @param solver_type factorization type: "llt" or "ldlt"
-#' @param rao_blackwellization  use rao_blackwellization
-#' @param n_trace_iter  use how many iterations to approximate the trace (Hutchinson’s trick)
+#' @param nonsym_solver how the operator matrix \code{K} of a non-symmetric
+#'   model is factorized when estimating \code{tr(K^-1 dK)}.
+#'   "normal_equations" (default) takes a Cholesky of \code{t(K) K} and applies
+#'   \code{K^-1} as \code{(t(K) K)^-1 t(K)}; "lu" takes a sparse LU of
+#'   \code{K}. The Cholesky is the cheaper of the two for every non-symmetric
+#'   operator here. Its one cost is that it squares the
+#'   condition number of \code{K}, so switch to "lu" for an operator so
+#'   ill-conditioned that the Cholesky of \code{t(K) K} fails.
+#' @param rao_blackwellization  replace the sampled latent field by its conditional
+#'   expectation \code{E[W | Y, V]} in the gradient (default \code{TRUE}).
+#' @param n_trace_iter  use how many iterations to approximate the trace (Hutchinson’s trick).
+#'   The starting probe budget; with \code{trace_adapt = TRUE} it is retuned during the run.
+#' @param polish_iterations maximum iterations of the post-convergence polish,
+#'   whose averaged iterates (Polyak-Ruppert) are the reported estimate. It is a
+#'   cap and the polish stops earlier once the precision and drift tests pass.
+#'   The polish runs only if the search converged. A search that exhausts
+#'   \code{iterations} gets no polish at all, and its estimate is the last-batch
+#'   mean rather than an average. The budget is capped at the iterations actually
+#'   run only under \code{conv_criterion = "drift"}; under \code{"stationarity"}
+#'   (the default) the full \code{polish_iterations} is available however short
+#'   the search was.
+#' @param polish_decay_alpha exponent of the step-size decay applied during the
+#'   polish, as \code{(1 + i/polish_decay_t0)^-alpha} in the polish iterations
+#'   \code{i}. Set 0 to hold the polish step size constant.
+#' @param polish_decay_t0 timescale of that decay, in polish iterations.
+#' @param conv_criterion which stopping rule the search phase uses:
+#'   \code{"stationarity"} (default) or \code{"drift"}.
+#' @param stationarity_window length of the comparison window, in checkpoints.
+#'   \code{0} (default) derives it from the measured correlation length.
+#' @param stationarity_eff effective samples per half-window when the window is
+#'   derived (default 1.5).
+#' @param schedule_arm_z threshold for arming the optional step-size schedule
+#'   (\code{stepsize_control}). It does not gate the stationarity criterion,
+#'   which uses \code{stationarity_ratio_lim}.
+#' @param polish_floor_frac lower bound on the polish step, as a fraction of
+#'   the step the polish starts from (default 0.25).
+#' @param n_trace_iter_k probe budget for the operator traces, which feed both
+#'   the gradient of the operator parameters and the operator block of the
+#'   preconditioner. \code{NA} (the default) uses \code{n_trace_iter}. A probe
+#'   against the operator is cheaper than one against the full precision, so the
+#'   two need not be carried at the same value.
+#' @param trace_adapt_k whether \code{trace_adapt} also retunes the probe budget
+#'   used for the operator traces, which enter the gradient of the operator
+#'   parameters. Without it only the budget for the block precision is retuned
+#'   and the operator keeps the budget it was built with. Off by default.
+#' @param stationarity_ratio_lim how far a parameter may move between the two
+#'   halves of the window, as a multiple of \code{se_stat} (default 1.0).
+#' @param stationarity_dir_lim a parameter failing the magnitude test is called a
+#'   flat direction and is excluded from the stopping rule and reported, only if its
+#'   successive half-differences cancel, \code{|sum| / sum|.|} below this
+#'   (default 0.5). One still travelling toward stationarity moves the same way
+#'   each time and keeps the ratio high.
+#' @param mc_se_lim target for the polish, as a multiple of the statistical
+#'   error: it runs until the Monte Carlo error of the reported average falls
+#'   under \code{mc_se_lim * se_stat}. Total error is then about
+#'   \code{sqrt(1 + mc_se_lim^2) * se_stat} and the cost goes as
+#'   \code{1 / mc_se_lim^2}, so tightening it is quadratically expensive for a
+#'   shrinking return. It touches only the polish phace, the search is unaffected.
+#' @param stationarity_dir_scaled compare \code{dir * sqrt(n)} against
+#'   \code{stationarity_dir_lim} rather than \code{dir} alone, and hold the
+#'   direction history to \code{stationarity_min_checks} rather than twice it.
+#'   \code{dir = |sum d| / sum|d|} has expectation \code{1/sqrt(n)} under a
+#'   stationary null, so a fixed threshold gets steadily more permissive as the
+#'   history fills, and the window length ends up setting the test's strictness.
+#'   Scaling by \code{sqrt(n)} holds it constant, which matters because the
+#'   direction this errs in is premature release of a drifting parameter.
+#' @param stationarity_min_checks checkpoints of history required before a
+#'   parameter may be called a flat direction (default 6).
+#' @param polish_stepsize_factor multiplies the step size at the moment the
+#'   polish begins. Default 1.0.
+#' @param selinv_max_fill use the exact selected (Takahashi) inverse for the
+#'   Rao-Blackwell traces of the block precision when the Cholesky factor of QQ
+#'   has \code{nnz(L)/n} at or below this, and Hutchinson probes otherwise.
+#'   Triangular operators (ar1, ou, arma) and 1-d meshes give a banded QQ with a
+#'   ratio near 2-3, where the exact route is both cheaper and free of probe
+#'   noise; a 2-d mesh is nearer 35, where it is far slower. Set to 0 to always
+#'   probe. This is a fill threshold rather than a cost comparison on purpose:
+#'   the two routes reach very different fractions of peak throughput per
+#'   operation -- a probe is a triangular solve over a block of right-hand sides
+#'   and vectorises better the denser the factor gets, while the Takahashi
+#'   recursion is a scalar scatter/gather -- and the spread between them is
+#'   wider than the margin that separates the models wanting one route from
+#'   those wanting the other, so counting operations does not decide it.
+#' @param n_fisher_probes probe budget for the expected-information estimate the
+#'   preconditioner uses for the measurement scale. \code{NA} (the default)
+#'   follows \code{n_trace_iter}, which is how it has been sized until now --
+#'   but that budget is chosen against gradient variance, which is a different
+#'   target, so the two can be set apart.
+#' @param selinv_cost_ratio how much dearer one exact selected inverse of the
+#'   OPERATOR may be than the probe budget it replaces and still be preferred.
+#'   This governs the operator traces only; the block precision is gated by
+#'   \code{selinv_max_fill}. Both sides are counted in operations, read off the
+#'   factor's sparsity pattern once at the start of a fit, and the choice is
+#'   then fixed for the run. Counting rather than timing is what keeps a fit
+#'   reproducible: a rule that consults the clock can decide differently on a
+#'   busy machine. Above one because the exact route carries no estimation
+#'   variance, which probing cannot buy at any finite budget. The comparison is
+#'   only trusted here because on the operator side it is not close -- the
+#'   operator's factor is far sparser than the probes it replaces, and every
+#'   model tested clears the threshold by more than an order of magnitude.
+#' @param selinv_max_fill_k the same bound for the operator traces, and
+#'   \code{Inf} by default, so there the operation-count comparison always
+#'   decides and no fill threshold pre-empts it. The operator can afford that
+#'   where the block precision cannot: its traces are taken once per optimizer
+#'   iteration, whereas the block-precision traces are retaken on every Gibbs
+#'   pass, so the exact route is charged far less over a run, and for operators
+#'   that factor into a tensor product it decomposes through the factors.
+#'   Set a finite value to restore a hard gate.
+#' @param trace_adapt size the Hutchinson probe count automatically (default \code{TRUE}).
+#'   The estimator's own variance falls as 1/N and is measured from the spread of the probes,
+#'   while the Gibbs sampling noise is measured across iterations; the budget is set so the
+#'   former is \code{trace_adapt_frac} of the latter. Only active when Rao-Blackwellisation
+#'   is on, since that is where the trace estimators feed the gradient.
+#' @param trace_adapt_frac target share of the total gradient variance carried by the trace
+#'   estimator (default 0.1, i.e. it adds about 5\% to the gradient standard deviation). A
+#'   deadband leaves the budget alone while the measured share is within a factor of two of
+#'   this, so the achieved share settles between roughly \code{0.5 * trace_adapt_frac} and
+#'   \code{2 * trace_adapt_frac}. Updates are damped and capped at 25\% per step, so the
+#'   budget approaches its target over several updates rather than jumping.
+#' @param trace_adapt_every minimum iterations between probe-budget updates,
+#'   rounded up to the next convergence checkpoint. The budget is changed only
+#'   at those checkpoints, because that is where the parallel chains meet: every
+#'   chain is given the same budget, since \code{R_hat} reads the spread between
+#'   chains as evidence about the spread within them and chains probing at
+#'   different budgets carry different estimator variances.
+#'
+#'   Because each update is capped at 25\%, this also sets how far the budget can
+#'   travel in a run, and the default is deliberately slow: it leaves the budget
+#'   near where it started. Lowering it lets the budget reach what the
+#'   measurement asks for, which is worth doing when the trace estimator is the
+#'   only noise in the gradient -- an all-Gaussian Rao-Blackwell fit -- and is
+#'   wasted work when it is not. With a non-Gaussian noise the Gibbs sampling
+#'   carries most of the gradient variance, extra probes do not move the
+#'   estimate, and the budget is sized off the worst-served parameter, which
+#'   raises it anyway. Measure before lowering it.
+#' @param trace_adapt_min,trace_adapt_max bounds on the adapted probe count.
+#' @param trace_adapt_rule how \code{trace_adapt} sizes the probe budget.
+#'   \describe{
+#'     \item{"cost"}{(default) hold the budget through the search and size it in
+#'       the polish to minimise the variance of the reported estimate per unit
+#'       of work: \eqn{N^* = \sqrt{(P/V_{gibbs})(a/b)}}, capped where the probes
+#'       cost as much as the rest of a pass. Under this rule an all-Gaussian
+#'       Rao-Blackwell fit -- where the probes are the only gradient noise --
+#'       also gets the cheapest usable colouring from the first iteration.}
+#'     \item{"share"}{size the budget so the trace estimator carries
+#'       \code{trace_adapt_frac} of the gradient variance, retuned throughout
+#'       the search. The behaviour before the cost rule existed.}
+#'   }
+#'
+#'   \code{"share"} targets a share of a quantity that contains the thing being
+#'   controlled, so on a converging fit it reduces to holding probe noise to a
+#'   fraction of the drift, and the budget climbs to \code{trace_adapt_max}
+#'   whatever it measures. \code{"cost"} has no such hole and responds to a
+#'   better estimator by asking for fewer probes.
+#'
+#'   Two limits. A fit that never converges never polishes, so its budget stays
+#'   where the search put it -- fine unless the probes are what is holding it
+#'   back; \code{"share"} is the fallback if a fit needs its budget to grow.
+#'   And the cost model treats the per-probe cost as constant when wider probe
+#'   blocks are cheaper per column, so it under-spends rather than over-spends.
+#' @param trace_probing structure the Hutchinson probes against the sparsity of
+#'   the model rather than drawing them densely (default \code{TRUE}).
+#'
+#'   The error of a Hutchinson estimate is carried by the off-diagonal terms,
+#'   and no choice of probe distribution removes them. What does is the support:
+#'   colour the graph of the precision so that two indices share a colour only
+#'   when they are several edges apart, and give each probe signs on one colour
+#'   class only. The surviving terms are pairs within a class, whose entry of
+#'   the inverse has already decayed. Still exactly unbiased; the variance falls
+#'   geometrically in the colouring distance where more dense probes buy only
+#'   \eqn{1/\sqrt{N}}.
+#'
+#'   It does not raise the probe count: the distance is the largest whose colour
+#'   count fits the budget in force, leftover budget goes into repeat sign draws,
+#'   and a budget too small for a distance-1 colouring falls back to dense
+#'   probes. The colour count is set by the mesh's local connectivity, not its
+#'   size, so the same budget buys the same structure at any \code{n}.
+#'
+#'   The gain is in the block-precision traces and \eqn{tr(K^{-1} dK)}. The
+#'   Hessian pair \eqn{tr(K^{-1}K_k K^{-1}K_j)} gains little -- two inverses
+#'   roughly double the decay length -- but rides the same probe block.
+#' @param trace_probing_max_dist largest colouring distance \code{trace_probing}
+#'   may consider (default 4). The budget bounds the probe count either way, so
+#'   this only widens the search for a usable colouring; each colouring is
+#'   computed once per sparsity pattern and cached.
+#' @param trace_probing_raise_budget the most \code{n_trace_iter} may be
+#'   multiplied by to reach the smallest budget at which \code{trace_probing}
+#'   engages (default \code{1}, i.e. never). A colouring costs one probe per
+#'   colour and that count is a property of the mesh, so a small
+#'   \code{n_trace_iter} can sit below the point where any colouring fits.
+#'   Raising this lets the budget climb to that point and no further, bounded
+#'   also by \code{trace_adapt_max}; a bound below the floor raises nothing
+#'   rather than raising partway. It is off by default because the extra probes
+#'   were measured to buy accuracy but not convergence. Ignored under
+#'   \code{trace_adapt_rule = "cost"}, which makes this decision itself.
 #'
 #' @param verbose print estimation
 #' @param store_traj store the optimizer trajectory for diagnostics (set FALSE to reduce memory)
@@ -61,22 +326,75 @@
 #'   For polynomial schedule, \code{poly_decay(..., burnin_iter = B)} keeps
 #'   schedule scale at 1 for the first \code{B} iterations, then starts decay
 #'   with reset local time index.
+#' @param nig_param_std coordinates the optimiser uses for stationary NIG
+#'   measurement noise, following Cabral, Bolin and Rue (2023). They apply when
+#'   the measurement noise is NIG with scalar, free and stationary \code{mu},
+#'   \code{sigma} and \code{nu}, unshifted \code{nu} and no correlation;
+#'   otherwise the native coordinates are used. In the native parameters the
+#'   variance \code{h(sigma^2 + mu^2/nu)} is shared by all three, giving a long
+#'   flat ridge; these coordinates turn that ridge into an axis. Only the
+#'   optimiser's coordinates change and the objective, the priors and the
+#'   reported estimates stay native, so fits remain comparable across settings.
+#'
+#'   \describe{
+#'     \item{0}{native \code{(theta_mu, log sigma, log nu)}}
+#'     \item{1}{standardised \code{(log sigma_marg, zeta,
+#'       log eta)} with \code{eta = 1/nu}, \code{zeta = mu/sigma} and
+#'       \code{sigma_marg = sqrt(sigma^2 + mu^2/nu)} the marginal SD}
+#'     \item{2}{additionally orthogonalised,
+#'       \code{zeta* = zeta sqrt(eta)}, \code{eta* = eta / xi^2} with
+#'       \code{xi = 1 + zeta*^2 - |zeta*| sqrt(1 + zeta*^2)}, which makes the
+#'       kurtosis invariant to skewness}
+#'     \item{3}{as 2 with \code{zeta*} carried as \code{asinh(zeta*)}, which
+#'       keeps the skewness coordinate unbounded and better scaled (default)}
+#'   }
+#' @param precond_meas_sigma curvature \code{precond_sgd()} uses for the
+#'   measurement noise \code{sigma}.
+#'   \describe{
+#'     \item{"auto"}{(default) the marginal Fisher information for non-Gaussian
+#'       measurement noise, the complete-data Hessian for Gaussian noise.}
+#'     \item{"fisher"}{always the marginal Fisher information, with the latent
+#'       field integrated out. It keeps \code{sigma} from stalling near zero
+#'       when the starting values are poor, e.g. fixed effects started far
+#'       from their OLS estimates, at some extra cost per iteration.}
+#'     \item{"complete"}{always the complete-data Hessian. Only supported for
+#'       Gaussian measurement noise; other noise uses \code{"fisher"}, with a
+#'       warning.}
+#'   }
+#'   Only used for uncorrelated measurement noise.
+#' @param fisher_refresh_every how often, in iterations, the Fisher information
+#'   for the measurement \code{sigma} is recomputed (default 10). It is also
+#'   recomputed as soon as \code{sigma} has moved by more than 5\%, and is
+#'   never computed more than once per iteration.
 #' @param robust use robust mode in the backend optimizer/model updates
+#' @param continue_chains make \code{ngme(start = previous_fit)} a true
+#'   continuation (default \code{TRUE}). Three things follow from it:
+#'   \code{start_sd} is not applied,  each chain resumes
+#'   from its OWN final parameters and its own latent state (\code{W} and the
+#'   mixing variables \code{V}); and
+#'   the stored optimisation trajectory is concatenated across the restarts
+#'   instead of replaced. A run split into chunks is then the same optimisation
+#'   as one long run.
+#'
+#'   Set \code{FALSE} to recover the old behaviour, which is what you want if
+#'   you are deliberately re-dispersing chains from a fitted point to test
+#'   whether they return to it. The per-chain part is skipped, with a warning,
+#'   when the previous fit has a different parameterization; the no-jitter part
+#'   still applies, since it needs nothing from the previous fit but the fact
+#'   that it is one.
 #' @param R_hat_conv_check use the R-hat diagnostic for convergence checking
-#' @param pflug_conv_check use Pflug diagnostic for convergence check
-#' @param pflug_alpha scaling factor (0-1] for Pflug criterion: require \code{pflug_sum < pflug_alpha * max_pflug_sum}
 #' @param max_R_hat maximum allowed R_hat
 #' @return list of control variables
 #' @export
 control_opt <- function(
-    seed = Sys.time(),
+    seed = ngme_random_seed(),
     burnin = 100,
     iterations = 500,
     estimation = TRUE,
     standardize_fixed = TRUE,
-    n_batch = 10,
-    iters_per_check = iterations / n_batch,
-    optimizer = adam(),
+    n_batch = NULL,
+    iters_per_check = 25,
+    optimizer = precond_sgd(),
     start = NULL,
     start_sd = 0.5,
     # parallel options
@@ -85,30 +403,83 @@ control_opt <- function(
     print_check_info = FALSE,
     max_relative_step = 0.5,
     max_absolute_step = 0.5,
-    rao_blackwellization = FALSE,
+    step_clip = c("adaptive", "norm", "value"),
+    step_clip_factor = 5,
+    rao_blackwellization = TRUE,
     n_trace_iter = 10,
+    polish_iterations = 2000L,
+    polish_stepsize_factor = 1.0,
+    polish_decay_alpha = 0.6,
+    polish_decay_t0 = 13.5,
+    selinv_max_fill = 4,
+    selinv_cost_ratio = 2,
+    n_fisher_probes = NA_integer_,
+    selinv_max_fill_k = Inf,
+    trace_adapt = TRUE,
+    trace_adapt_frac = 0.1,
+    trace_adapt_every = 100L,
+    trace_adapt_min = 5L,
+    trace_adapt_max = 200L,
+    trace_adapt_rule = c("cost", "share"),
+    trace_probing = TRUE,
+    trace_probing_max_dist = 4L,
+    trace_probing_raise_budget = 1,
+    n_trace_iter_k = NA_integer_,
+    trace_adapt_k = FALSE,
+    trace_block_probe = FALSE,
     sampling_strategy = "all",
-    solver_backend = "cholmod",
+    solver_backend = if (Sys.info()["sysname"] == "Darwin") "accelerate" else "cholmod",
     solver_type = "llt",
+    nonsym_solver = "normal_equations",
+    solver_order = c("auto", "default", "amd", "metis"),
     # opt print
     verbose = FALSE,
     store_traj = TRUE,
     robust = FALSE,
+    nig_param_std = 3,
+    precond_meas_sigma = c("auto", "fisher", "complete"),
+    fisher_refresh_every = 10L,
     stepsize_control = NULL,
-    n_min_batch = min(n_batch, 3),
-    n_slope_check = min(n_batch, 3),
+    n_min_batch = 1,
+    n_slope_check = 3,
     trend_std_conv_check = TRUE,
     std_lim = 0.01,
-    trend_lim = 0.01,
+    trend_lim = 2,
+    trend_rel_lim = 0.01,
+    use_std_check = FALSE,
+    n_conv_batch = 2,
+    warn_no_convergence = TRUE,
+    schedule_auto_start = FALSE,
+    schedule_min_scale = 0.1,
+    schedule_arm_z = 2,
+    stationarity_window = 0L,
+    stationarity_eff = 1.5,
+    polish_floor_frac = 0.25,
+    stationarity_ratio_lim = 1.0,
+    stationarity_dir_lim = 0.5 * sqrt(6),
+    stationarity_min_checks = 6L,
+    stationarity_dir_scaled = TRUE,
+    conv_criterion = c("stationarity", "drift"),
+    mc_se_conv_check = TRUE,
+    mc_se_lim = 0.7,
+    max_stepsize_decays = 1L,
+    n_settle_checks = 3L,
+    stepsize_decay_precision_gamma = 0.5,
+    continue_chains = TRUE,
     R_hat_conv_check = TRUE,
-    max_R_hat = 1.1,
-    pflug_conv_check = TRUE,
-    pflug_alpha = 0.9) {
+    max_R_hat = 1.1) {
+  step_clip <- match.arg(step_clip)
+  precond_meas_sigma <- match.arg(precond_meas_sigma)
+  stopifnot(
+    "fisher_refresh_every must be a positive whole number" =
+      length(fisher_refresh_every) == 1 && is.finite(fisher_refresh_every) &&
+      fisher_refresh_every >= 1 && fisher_refresh_every == round(fisher_refresh_every)
+  )
   strategy_list <- c("all", "ws")
-  preconditioner_list <- c("none", "fast", "full")
-  solver_backend_list <- c("eigen", "cholmod", "pardiso")
+  solver_backend_list <- c("eigen", "cholmod", "accelerate", "pardiso")
   solver_factor_list <- c("llt", "ldlt")
-  stepsize_decay_list <- c("none", "grad_norm_plateau")
+  nonsym_solver_list <- c("lu", "normal_equations")
+  stepsize_decay_list <- c("none", "grad_norm_plateau", "trend")
   stepsize_schedule_list <- c("constant", "poly")
 
   if (!is.null(start)) {
@@ -134,35 +505,71 @@ control_opt <- function(
   stepsize_schedule_t0 <- stepsize_control$schedule$t0
   stepsize_schedule_burnin_iter <- stepsize_control$schedule$burnin_iter
 
-  # read preconditioner from optimizer
-  preconditioner <- "none"
   numerical_eps <- 1e-5
-  precond_by_diff_chain <- FALSE
-  compute_precond_each_iter <- FALSE
   if (optimizer$method == "precond_sgd") {
-    preconditioner <- optimizer$preconditioner
     numerical_eps <- optimizer$numerical_eps
-    precond_by_diff_chain <- optimizer$precond_by_diff_chain
-    compute_precond_each_iter <- optimizer$compute_precond_each_iter
   }
 
-  # if user inputs iters_per_check
-  if (!missing(iters_per_check) && !missing(n_batch)) {
-    stop("Specify only one of iters_per_check and n_batch")
-  } else if (!missing(iters_per_check)) {
-    stopifnot(
-      "iterations should be multiple of iters_per_check" = iterations %% iters_per_check == 0
-    )
-    n_batch <- iterations / iters_per_check
+  # `iters_per_check` is how often the convergence checks run, and is now the
+  # only way to set that. `n_batch` survives below as a DERIVED count -- how
+  # many checkpoints a run will have -- which sizes the diagnostic buffers and
+  # bounds the trend window; it is no longer something a caller sets.
+  # Deprecation notices fire once per session: a fit is often called in a loop,
+  # and a warning repeated hundreds of times buries whatever else is reported.
+  .warn_once <- function(...) {
+    if (!isTRUE(getOption("ngme2.n_batch_deprecated_warned", FALSE))) {
+      options(ngme2.n_batch_deprecated_warned = TRUE)
+      warning(..., call. = FALSE)
+    }
   }
+  if (!is.null(n_batch)) {
+    # Deprecated, and NOT translated into iters_per_check. It set the interval
+    # as a division of the iteration budget, so raising `iterations` silently
+    # checked less often and a run sat past its convergence point; honouring it
+    # would preserve exactly the behaviour it is deprecated for. The explicit
+    # iters_per_check wins if one was given, otherwise the default applies.
+    if (!missing(iters_per_check)) {
+      .warn_once("n_batch is deprecated and was ignored in favour of ",
+                 "iters_per_check = ", iters_per_check, ".")
+    } else {
+      .warn_once("n_batch is deprecated and was IGNORED; the convergence ",
+                 "checks now run every iters_per_check = ", iters_per_check,
+                 " iterations regardless of `iterations`. Pass ",
+                 "iters_per_check to choose the interval.")
+    }
+  }
+  stopifnot(
+    "iters_per_check must be a positive whole number" =
+      length(iters_per_check) == 1 && is.finite(iters_per_check) &&
+      iters_per_check >= 1 && iters_per_check == round(iters_per_check)
+  )
+  iters_per_check <- min(as.integer(iters_per_check), as.integer(iterations))
+  # How many checkpoints the buffers must hold. `iterations` need NOT be a
+  # multiple of the interval: the final batch is clamped in C++.
+  n_batch <- as.integer(ceiling(iterations / iters_per_check))
+  # The trend window cannot be longer than the run has checkpoints. It used to
+  # follow n_batch by construction; now that the interval is fixed, a short run
+  # can have fewer checkpoints than the default window.
+  n_slope_check <- min(as.integer(n_slope_check), n_batch)
+  # n_min_batch and n_slope_check are denominated in CHECKPOINTS, so their
+  # meaning moves with the interval; neither can exceed the number of
+  # checkpoints a run will have. Clamping preserves the intent -- "wait this
+  # long before believing the diagnostic" -- where erroring would only punish a
+  # caller for a unit they did not choose.
+  n_min_batch <- min(as.integer(n_min_batch), n_batch)
 
   # resolve solver backend + factorization; send both to C++ and let it map
   solver_backend <- match.arg(solver_backend, solver_backend_list)
   solver_factor <- match.arg(solver_type, solver_factor_list)
+  nonsym_solver <- match.arg(nonsym_solver, nonsym_solver_list)
+  solver_order <- match.arg(solver_order)
+  # -1 leaves Accelerate's own default in place; the rest are SparseOrder_t.
+  solver_order_idx <- c(default = -1L, auto = -2L, amd = 2L, metis = 3L)[[solver_order]]
   stepsize_decay_method <- match.arg(stepsize_decay_method, stepsize_decay_list)
   stepsize_schedule_method <- match.arg(stepsize_schedule_method, stepsize_schedule_list)
   solver_backend_idx <- match(solver_backend, solver_backend_list) - 1L
   solver_factor_idx <- match(solver_factor, solver_factor_list) - 1L
+  nonsym_solver_idx <- match(nonsym_solver, nonsym_solver_list) - 1L
 
   if (identical(optimizer$method, "sgld") &&
       identical(stepsize_schedule_method, "constant") &&
@@ -175,7 +582,7 @@ control_opt <- function(
     )
   }
 
-  # platform guard: pardiso disabled on builds without MKL
+  # platform guard: accelerate only on macOS; pardiso disabled on macOS builds without MKL
   is_mac <- Sys.info()["sysname"] == "Darwin"
   if (solver_backend == "pardiso" && !has_pardiso()) {
     stop(
@@ -186,14 +593,16 @@ control_opt <- function(
   if (is_mac && solver_backend == "pardiso" && !has_pardiso()) {
     stop("solver_backend 'pardiso' is not available on this macOS build; reinstall with MKLROOT to enable Pardiso.")
   }
+  if (!is_mac && solver_backend == "accelerate") {
+    stop("solver_backend 'accelerate' is only available on macOS")
+  }
+
   stopifnot(
     sampling_strategy %in% strategy_list,
-    preconditioner %in% preconditioner_list,
     "start_sd must be a numeric scalar" =
       is.numeric(start_sd) && length(start_sd) == 1 && is.finite(start_sd),
     is.numeric(max_num_threads) && length(max_num_threads) == 1,
     iterations > 0 && n_batch > 0,
-    "iterations should be multiple of n_batch" = iterations %% n_batch == 0,
     "n_min_batch must be numeric" = is.numeric(n_min_batch),
     "n_min_batch must be a single value" = length(n_min_batch) == 1,
     "n_min_batch must be greater than 0" = n_min_batch > 0,
@@ -201,9 +610,8 @@ control_opt <- function(
     is.numeric(n_slope_check) && length(n_slope_check) == 1 &&
       n_slope_check > 0 && n_slope_check <= n_batch,
     inherits(optimizer, "ngme_optimizer"),
-    "solver backend must map to 0:2" = solver_backend_idx %in% 0:2,
+    "solver backend must map to 0:3" = solver_backend_idx %in% 0:3,
     "solver factor must be 0 (llt) or 1 (ldlt)" = solver_factor_idx %in% 0:1,
-    is.numeric(pflug_alpha) && length(pflug_alpha) == 1 && pflug_alpha > 0 && pflug_alpha <= 1,
     "stepsize_decay must be one of 'none' or 'grad_norm_plateau'" =
       stepsize_decay_method %in% stepsize_decay_list,
     "stepsize_decay_patience must be >= 1" =
@@ -245,9 +653,22 @@ control_opt <- function(
         (stepsize_schedule_alpha > 0.5 && stepsize_schedule_alpha < 1)
   )
 
-  if (n_parallel_chain == 1) {
-    precond_by_diff_chain <- FALSE
-  }
+  trace_adapt_rule <- match.arg(trace_adapt_rule)
+  stopifnot(
+    "trace_probing must be a single TRUE or FALSE" =
+      is.logical(trace_probing) && length(trace_probing) == 1 &&
+        !is.na(trace_probing),
+    "trace_probing_max_dist must be a positive integer scalar" =
+      is.numeric(trace_probing_max_dist) &&
+        length(trace_probing_max_dist) == 1 &&
+        is.finite(trace_probing_max_dist) && trace_probing_max_dist >= 1,
+    "trace_probing_raise_budget must be a single number >= 1" =
+      is.numeric(trace_probing_raise_budget) &&
+        length(trace_probing_raise_budget) == 1 &&
+        is.finite(trace_probing_raise_budget) &&
+        trace_probing_raise_budget >= 1
+  )
+  trace_probing_max_dist <- as.integer(trace_probing_max_dist)
 
   # variance reduction techniques (not used for now)
   {
@@ -270,30 +691,70 @@ control_opt <- function(
     standardize_fixed = standardize_fixed,
     n_parallel_chain = n_parallel_chain,
     n_batch = n_batch,
+    iters_per_check = iters_per_check,
     n_min_batch = n_min_batch, # minimum batches before checking
     n_slope_check = n_slope_check, # window for trend regression
     std_lim = std_lim,
     trend_lim = trend_lim,
+    trend_rel_lim = trend_rel_lim,
+    use_std_check = use_std_check,
+    n_conv_batch = n_conv_batch,
+    warn_no_convergence = warn_no_convergence,
+    schedule_auto_start = schedule_auto_start,
+    schedule_min_scale = schedule_min_scale,
+    schedule_arm_z = schedule_arm_z,
+    stationarity_window = stationarity_window,
+    stationarity_eff = stationarity_eff,
+    polish_floor_frac = polish_floor_frac,
+    stationarity_ratio_lim = stationarity_ratio_lim,
+    stationarity_dir_lim = stationarity_dir_lim,
+    stationarity_min_checks = as.integer(stationarity_min_checks),
+    stationarity_dir_scaled = stationarity_dir_scaled,
+    conv_criterion = match.arg(conv_criterion),
+    mc_se_conv_check = mc_se_conv_check,
+    mc_se_lim = mc_se_lim,
+    max_stepsize_decays = as.integer(max_stepsize_decays),
+    n_settle_checks = as.integer(n_settle_checks),
+    stepsize_decay_precision_gamma = stepsize_decay_precision_gamma,
+    continue_chains = continue_chains,
     num_threads = c(
-      max(n_parallel_chain, 1),
+      max(min(n_parallel_chain, max_num_threads), 1),
       max(floor(max_num_threads / n_parallel_chain), 1)
     ),
     rao_blackwellization = rao_blackwellization,
     n_trace_iter = n_trace_iter,
+    polish_iterations = polish_iterations,
+    polish_stepsize_factor = polish_stepsize_factor,
+    polish_decay_alpha = polish_decay_alpha,
+    polish_decay_t0 = polish_decay_t0,
+    selinv_max_fill = selinv_max_fill,
+    selinv_cost_ratio = selinv_cost_ratio,
+    n_fisher_probes = as.integer(n_fisher_probes),
+    selinv_max_fill_k = selinv_max_fill_k,
+    trace_adapt = trace_adapt,
+    trace_adapt_frac = trace_adapt_frac,
+    trace_adapt_every = trace_adapt_every,
+    trace_adapt_min = trace_adapt_min,
+    trace_adapt_max = trace_adapt_max,
+    trace_adapt_rule = trace_adapt_rule,
+    trace_probing = trace_probing,
+    trace_probing_max_dist = trace_probing_max_dist,
+    trace_probing_raise_budget = trace_probing_raise_budget,
+    n_trace_iter_k = as.integer(n_trace_iter_k),
+    trace_adapt_k = trace_adapt_k,
+    trace_block_probe = trace_block_probe,
     print_check_info = print_check_info,
     verbose = verbose,
     store_traj = store_traj,
-    sampling_strategy = which(strategy_list == sampling_strategy) - 1, # start from 0,
-
+    sampling_strategy = which(strategy_list == sampling_strategy) - 1, # start from 0
     max_relative_step = max_relative_step,
     max_absolute_step = max_absolute_step,
+    step_clip_mode = match(step_clip, c("value", "norm", "adaptive")) - 1L,
+    step_clip_factor = step_clip_factor,
     trend_std_conv_check = trend_std_conv_check,
 
     # preconditioner related
     numerical_eps = numerical_eps,
-    precond_by_diff_chain = precond_by_diff_chain,
-    compute_precond_each_iter = compute_precond_each_iter,
-    precond_strategy = which(preconditioner_list == preconditioner) - 1, # start from 0
 
     # optimization method related
     stepsize = optimizer$stepsize,
@@ -304,6 +765,8 @@ control_opt <- function(
     # solver related
     solver_backend = solver_backend_idx,
     solver_factor = solver_factor_idx,
+    nonsym_solver = nonsym_solver_idx,
+    solver_order = solver_order_idx,
 
     # stepsize decay
     stepsize_decay = stepsize_decay_method,
@@ -323,10 +786,11 @@ control_opt <- function(
     threshold = threshold,
     window_size = window_size,
     robust = robust,
+    nig_param_std = nig_param_std,
+    precond_meas_sigma = match(precond_meas_sigma, c("auto", "fisher", "complete")) - 1L,
+    fisher_refresh_every = as.integer(fisher_refresh_every),
     R_hat_conv_check = R_hat_conv_check,
-    max_R_hat = max_R_hat,
-    pflug_conv_check = pflug_conv_check,
-    pflug_alpha = pflug_alpha
+    max_R_hat = max_R_hat
   )
 
   class(control) <- "control_opt"
@@ -345,7 +809,6 @@ control_opt <- function(
 #'   \item \code{store_traj = TRUE}
 #'   \item \code{trend_std_conv_check = FALSE}
 #'   \item \code{R_hat_conv_check = FALSE}
-#'   \item \code{pflug_conv_check = FALSE}
 #'   \item \code{stepsize_control = poly_decay(alpha, t0, schedule_burnin_iter)}
 #' }
 #' Any of these can still be overridden through \code{...}.
@@ -353,7 +816,7 @@ control_opt <- function(
 #' @param optimizer optimizer object, default \code{sgd(stepsize = 0.03)}.
 #' @param burnin burn-in iterations before optimization.
 #' @param iterations optimization iterations.
-#' @param n_batch number of checkpoints.
+#' @param iters_per_check iterations between checkpoints (default 100).
 #' @param n_parallel_chain number of parallel chains.
 #' @param alpha polynomial stepsize exponent for \code{poly_decay(alpha, t0)}.
 #' @param t0 non-negative schedule offset.
@@ -368,7 +831,7 @@ control_opt_batch_ci <- function(
     optimizer = sgd(stepsize = 0.03),
     burnin = 100,
     iterations = 2000,
-    n_batch = 20,
+    iters_per_check = 100,
     n_parallel_chain = 4,
     alpha = 0.501,
     t0 = 1,
@@ -378,12 +841,11 @@ control_opt_batch_ci <- function(
     optimizer = optimizer,
     burnin = burnin,
     iterations = iterations,
-    n_batch = n_batch,
+    iters_per_check = iters_per_check,
     n_parallel_chain = n_parallel_chain,
     store_traj = TRUE,
     trend_std_conv_check = FALSE,
     R_hat_conv_check = FALSE,
-    pflug_conv_check = FALSE,
     stepsize_control = poly_decay(
       alpha = alpha,
       t0 = t0,
@@ -398,7 +860,17 @@ control_opt_batch_ci <- function(
 
 #' Generate control specifications for the ngme model
 #'
-#' @param n_gibbs_samples    number of gibbs samples at each iteration
+#' @param n_gibbs_samples    number of gibbs samples at each iteration.
+#'   Raising it lowers the variance of each gradient but costs proportionally more per
+#'   iteration, so the number of iterations needed to satisfy the
+#'   convergence checks is largely unchanged and the wall-clock time to
+#'   converge goes up. Raise it when the estimates are noisy at
+#'   convergence.
+#' @param post_burnin number of Gibbs sweeps to discard before recording the
+#'   posterior samples of W and V returned by \code{ngme()}. A burn-in is
+#'   needed because the chain is restarted from the stored W and V, which are
+#'   averaged over the parallel chains and so are not themselves a draw from
+#'   the posterior. Set to 0 only if you know the stored state is a valid draw.
 #' @param fix_beta       logical, fix fixed effect estimation
 #' @param beta_init      fixed effect initial value on the original design
 #'   scale. If \code{control_opt(standardize_fixed = TRUE)} (the default), the
@@ -409,11 +881,12 @@ control_opt_batch_ci <- function(
 #' @param debug          debug mode
 #' @param ... additional arguments. Legacy aliases \code{feff} and
 #'   \code{fix_feff} are still recognized and mapped to \code{beta_init} and
-#'   \code{fix_beta}.
+#'   \code{fix_beta}. Anything else is ignored with a warning naming it.
 #' @return a list of control variables for ngme
 #' @export
 control_ngme <- function(
     n_gibbs_samples = 5,
+    post_burnin = 100,
     fix_beta = FALSE,
     n_post_samples = 100,
     beta_init = NULL,
@@ -424,8 +897,46 @@ control_ngme <- function(
   if (!is.null(dots$feff)) beta_init <- dots$feff
   if (!is.null(dots$fix_feff)) fix_beta <- dots$fix_feff
 
+  # Anything else in ... used to be dropped without a word, which quietly hides
+  # real mistakes: control_ngme(rao_blackwellization = FALSE) looks like it
+  # works but does nothing, since that argument belongs to control_opt(). Warn
+  # rather than stop, so existing scripts keep running.
+  legacy <- c("feff", "fix_feff")
+  nms <- names(dots)
+  if (is.null(nms)) nms <- rep("", length(dots))
+  unknown <- setdiff(nms[nzchar(nms)], legacy)
+  n_unnamed <- sum(!nzchar(nms))
+  if (length(unknown) || n_unnamed) {
+    bits <- character(0)
+    if (length(unknown))
+      bits <- c(bits, paste0("unrecognised argument(s) ",
+                             paste0("`", unknown, "`", collapse = ", ")))
+    if (n_unnamed)
+      bits <- c(bits, sprintf("%d unnamed argument(s)", n_unnamed))
+    msg <- paste0("control_ngme(): ", paste(bits, collapse = " and "),
+                  " ignored.")
+    # The most likely mistake is reaching for a control_opt() argument.
+    opt_args <- setdiff(names(formals(control_opt)), "...")
+    in_opt <- intersect(unknown, opt_args)
+    if (length(in_opt))
+      msg <- paste0(msg, "\n  ", paste0("`", in_opt, "`", collapse = ", "),
+                    if (length(in_opt) == 1L) " is an argument of"
+                    else " are arguments of",
+                    " control_opt(), not control_ngme().")
+    # Otherwise offer the nearest formal, which catches plain typos.
+    own <- setdiff(names(formals(control_ngme)), "...")
+    rest <- setdiff(unknown, in_opt)
+    near <- unlist(lapply(rest, function(u) {
+      cand <- agrep(u, own, max.distance = 0.3, value = TRUE)
+      if (length(cand)) sprintf("`%s` -> did you mean `%s`?", u, cand[1]) else NULL
+    }))
+    if (length(near)) msg <- paste0(msg, "\n  ", paste(near, collapse = "\n  "))
+    warning(msg, call. = FALSE)
+  }
+
   control <- list(
     n_gibbs_samples = n_gibbs_samples,
+    post_burnin = post_burnin,
     fix_beta = fix_beta,
     beta_init = beta_init,
     # legacy names preserved for downstream code until fully migrated
@@ -442,10 +953,32 @@ control_ngme <- function(
 update_control_ngme <- function(control_ngme, control_opt) {
   control_ngme$rao_blackwellization <- control_opt$rao_blackwellization
   control_ngme$n_trace_iter <- control_opt$n_trace_iter
+  control_ngme$selinv_max_fill <- control_opt$selinv_max_fill
+  control_ngme$selinv_cost_ratio <- control_opt$selinv_cost_ratio
+  control_ngme$n_fisher_probes <- control_opt$n_fisher_probes
+  control_ngme$selinv_max_fill_k <- control_opt$selinv_max_fill_k
+  control_ngme$trace_adapt <- control_opt$trace_adapt
+  control_ngme$trace_adapt_frac <- control_opt$trace_adapt_frac
+  control_ngme$trace_adapt_every <- control_opt$trace_adapt_every
+  control_ngme$trace_adapt_min <- control_opt$trace_adapt_min
+  control_ngme$trace_adapt_max <- control_opt$trace_adapt_max
+  control_ngme$trace_adapt_rule <- control_opt$trace_adapt_rule
+  control_ngme$trace_probing <- control_opt$trace_probing
+  control_ngme$trace_probing_max_dist <- control_opt$trace_probing_max_dist
+  control_ngme$trace_probing_raise_budget <-
+    control_opt$trace_probing_raise_budget
+  control_ngme$n_trace_iter_k <- control_opt$n_trace_iter_k
+  control_ngme$trace_adapt_k <- control_opt$trace_adapt_k
+  control_ngme$trace_block_probe <- control_opt$trace_block_probe
   control_ngme$stepsize <- control_opt$stepsize
   control_ngme$solver_backend <- control_opt$solver_backend
   control_ngme$solver_factor <- control_opt$solver_factor
+  control_ngme$nonsym_solver <- control_opt$nonsym_solver
+  control_ngme$solver_order <- control_opt$solver_order
   control_ngme$robust <- control_opt$robust
+  control_ngme$nig_param_std <- control_opt$nig_param_std
+  control_ngme$precond_meas_sigma <- control_opt$precond_meas_sigma
+  control_ngme$fisher_refresh_every <- control_opt$fisher_refresh_every
 
   control_ngme
 }

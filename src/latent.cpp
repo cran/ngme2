@@ -1,4 +1,6 @@
 #include "latent.h"
+#include <cstdlib>
+#include "include/thread_io.h"
 #include "prior.h"
 #include <algorithm>
 #include <chrono>
@@ -89,9 +91,9 @@ Latent::Latent(const Rcpp::List &model_list, unsigned long seed)
       A(Rcpp::as<SparseMatrix<double, 0, int>>(model_list["A"])),
 
       p_vec(V_size), a_vec(V_size), b_vec(V_size) {
-  if (W_size != V_size) {
-    throw std::invalid_argument("Latent: W_size must equal V_size");
-  }
+  if (debug)
+    ngme_io::out() << "begin constructor of latent" << std::endl;
+  assert(W_size == V_size);
 
   // construct from ngme_noise
   fix_flag[latent_fix_theta_K] = Rcpp::as<bool>(model_list["fix_theta_K"]);
@@ -184,9 +186,40 @@ Latent::Latent(const Rcpp::List &model_list, unsigned long seed)
   int solver_type = Rcpp::as<int>(model_list["solver_type"]);
   n_trace_iter_ = n_trace_iter;
   solver_type_ = solver_type;
+  trace_probing_ = model_list.containsElementNamed("trace_probing")
+                       ? Rcpp::as<bool>(model_list["trace_probing"])
+                       : true;
+  trace_probing_max_dist_ =
+      model_list.containsElementNamed("trace_probing_max_dist")
+          ? Rcpp::as<int>(model_list["trace_probing_max_dist"])
+          : 4;
+  trace_probing_max_colours_ =
+      model_list.containsElementNamed("trace_probing_max_colours")
+          ? Rcpp::as<int>(model_list["trace_probing_max_colours"])
+          : 0;
+  trace_probing_raise_budget_ =
+      model_list.containsElementNamed("trace_probing_raise_budget")
+          ? Rcpp::as<double>(model_list["trace_probing_raise_budget"])
+          : 1.0;
+  selinv_max_fill_ = model_list.containsElementNamed("selinv_max_fill")
+                         ? Rcpp::as<double>(model_list["selinv_max_fill"])
+                         : 4.0;
+  selinv_cost_ratio_ = model_list.containsElementNamed("selinv_cost_ratio")
+                           ? Rcpp::as<double>(model_list["selinv_cost_ratio"])
+                           : 2.0;
+  nonsym_solver_ = model_list.containsElementNamed("nonsym_solver")
+                       ? Rcpp::as<int>(model_list["nonsym_solver"])
+                       : 0;
   robust_ = model_list.containsElementNamed("robust")
                 ? Rcpp::as<bool>(model_list["robust"])
                 : false;
+  // Coordinates the optimiser works in for stationary NIG noise. The block
+  // passes the setting down with the rest of the per-latent options; without
+  // this read the mode stayed at its default and the reparameterisation could
+  // never engage.
+  nig_param_mode_ = model_list.containsElementNamed("nig_param_std")
+                        ? Rcpp::as<int>(model_list["nig_param_std"])
+                        : 0;
 
   // build mu, sigma, compute trace, ...
   update_each_iter(true);
@@ -206,6 +239,8 @@ Latent::Latent(const Rcpp::List &model_list, unsigned long seed)
     }
   }
 
+  if (debug)
+    ngme_io::out() << "End constructor of latent" << std::endl;
   last_gradient_ = VectorXd::Zero(n_params);
   last_precond_ = MatrixXd::Zero(n_params, n_params);
   invalidate_derivatives();
@@ -219,6 +254,7 @@ void Latent::invalidate_derivatives() {
   grad_cache_valid_ = false;
   precond_cache_valid_ = false;
 }
+
 
 Rcpp::List Latent::output() const {
   return Rcpp::List::create(
@@ -244,9 +280,13 @@ const VectorXd Latent::get_parameter() {
     parameter.segment(n_theta_K + n_theta_mu + n_theta_sigma, n_theta_nu) =
         theta_nu;
 
-  if (debug && parameter.size() > 0 &&
-      (std::isnan(parameter(0)) || std::isnan(-parameter(0)))) {
-    throw std::runtime_error("isnan");
+  if (nig_std_active())
+    parameter.segment(n_theta_K, 3) = nig_std_from_native();
+
+  if (debug) {
+    if (std::isnan(parameter(0)) || std::isnan(-parameter(0)))
+      throw std::runtime_error("isnan");
+    ngme_io::out() << "parameter= " << parameter << std::endl;
   }
 
   return parameter;
@@ -276,6 +316,8 @@ void Latent::compute_grad_and_hessian(bool rao_blackwell, bool with_precond) {
     return;
 
   if (need_grad) {
+    if (debug)
+      ngme_io::out() << "Start latent gradient compute" << std::endl;
     VectorXd grad = VectorXd::Zero(n_params);
 
     bool need_K = !fix_flag[latent_fix_theta_K];
@@ -299,13 +341,15 @@ void Latent::compute_grad_and_hessian(bool rao_blackwell, bool with_precond) {
     last_gradient_ = grad;
     grad_cache_valid_ = true;
     grad_cache_rb_mode_ = rao_blackwell;
+    if (debug)
+      ngme_io::out() << "finish latent gradient" << std::endl;
   }
 
   if (need_precond) {
     auto t_start = std::chrono::steady_clock::now();
 
     // Build analytic Hessian blocks (state already contains necessary
-    // derivatives)
+    // derivatives).
     compute_hessian_blocks(false);
 
     MatrixXd precond_full = MatrixXd::Zero(n_params, n_params);
@@ -343,19 +387,58 @@ void Latent::compute_grad_and_hessian(bool rao_blackwell, bool with_precond) {
     if (n_theta_nu > 0)
       precond_full.block(off_nu, off_nu, n_theta_nu, n_theta_nu) =
           hess_cache.H_nu;
+    if (nig_std_active()) {
+      MatrixXd J = nig_std_jacobian();
+      // noise-noise block
+      precond_full.block(off_mu, off_mu, 3, 3) =
+          J.transpose() * precond_full.block(off_mu, off_mu, 3, 3).eval() * J;
+      // cross blocks with theta_K: J on the noise side only
+      if (n_theta_K > 0) {
+        precond_full.block(off_K, off_mu, n_theta_K, 3) =
+            precond_full.block(off_K, off_mu, n_theta_K, 3).eval() * J;
+        precond_full.block(off_mu, off_K, 3, n_theta_K) =
+            precond_full.block(off_K, off_mu, n_theta_K, 3).transpose();
+      }
+    }
 
-    // Jitter to ensure PD in placeholder form
-    precond_full.diagonal().array() += 1e-5;
+    // Jitter to ensure PD in placeholder form.
+    // These blocks hold the Hessian, and Ngme::precond() returns its negative
+    // as the information matrix that the LLT solve factorises. Ridging the
+    // information therefore means SUBTRACTING here.
+    precond_full.diagonal().array() -= 1e-5;
 
     last_precond_ = precond_full;
     precond_cache_valid_ = true;
 
-    (void)t_start;
+    if (debug) {
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t_start)
+                    .count();
+      ngme_io::out() << "[latent] compute_precond_matrix (analytic skeleton) "
+                     "timing (ms): total="
+                  << ms << std::endl;
+    }
   }
 }
 
 void Latent::set_parameter_and_update(const VectorXd &theta,
                                       bool with_precond) {
+  // The optimiser may be working in the standardised coordinates; everything
+  // below (and every derivative) stays native, so convert on the way in.
+  if (nig_std_active()) {
+    double tm, ts, tn;
+    nig_std_to_native(theta.segment(n_theta_K, 3), tm, ts, tn);
+    if (!fix_flag[latent_fix_theta_K])
+      theta_K = theta.segment(0, n_theta_K);
+    theta_mu(0) = tm;
+    theta_sigma(0) = ts;
+    theta_nu(0) = tn;
+    state_ready_ = false;
+    state_has_precond_terms_ = false;
+    invalidate_derivatives();
+    update_each_iter(with_precond);
+    return;
+  }
   // nig, gal and normal+nig
   if (!fix_flag[latent_fix_theta_K])
     theta_K = theta.segment(0, n_theta_K);
@@ -378,7 +461,6 @@ void Latent::set_parameter_and_update(const VectorXd &theta,
 void Latent::sample_cond_V() {
   if (fix_flag[latent_fix_V])
     return;
-
   // update b_inc (p,a_inc already built)
   b_inc = (getK() * W + mu.cwiseProduct(h)).cwiseQuotient(sigma).array().pow(2);
 
@@ -444,9 +526,17 @@ void Latent::sample_uncond_V() {
   prevV = V;
   int n = V_size / n_noise;
 
-  // same logic as in simulation.R
+  // same logic as in simulation.R.
+  // NOTE the "normal" guards below. update_each_iter() skips Gaussian noise when
+  // filling p_vec/a_vec/b_vec, so for a Gaussian latent those are never
+  // initialised and feeding them to rGIG_cpp() yields NaN (and in the single_V
+  // branch `v` would be read uninitialised). V is constructed as h, which IS the
+  // Gaussian value, so the correct action is to leave it alone -- exactly what
+  // sample_cond_V() already does.
   if (single_V) {
     for (int i = 0; i < n_noise; i++) {
+      if (noise_type[i] == "normal")
+        continue;
       double v;
       if (noise_type[i] == "nig" || noise_type[i] == "normal_nig")
         v = rGIG_cpp(-0.5, nu[i], nu[i], latent_rng());
@@ -458,6 +548,8 @@ void Latent::sample_uncond_V() {
     }
   } else {
     for (int i = 0; i < n_noise; i++) {
+      if (noise_type[i] == "normal")
+        continue;
       // sample unconditional V
       V.segment(i * n, n) =
           rGIG_cpp(p_vec.segment(i * n, n), a_vec.segment(i * n, n),
@@ -497,6 +589,8 @@ void Latent::update_derivatives(bool need_grad_theta_K, bool need_grad_theta_mu,
 void Latent::compute_theta_K(bool need_grad, bool rao_blackwell) {
   if (!need_grad || deriv_cache.grad_K_ready)
     return;
+  auto t_total_start = std::chrono::steady_clock::now();
+  long long t_chain_ms = 0;
   VectorXd grad = VectorXd::Zero(n_theta_K);
   if (!fix_flag[latent_fix_theta_K]) {
     VectorXd WW = (rao_blackwell) ? cond_W : W;
@@ -520,6 +614,13 @@ void Latent::compute_theta_K(bool need_grad, bool rao_blackwell) {
           grad(i) = 0.0;
     }
   }
+  if (debug) {
+    auto t_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - t_total_start)
+                          .count();
+    ngme_io::out() << "[latent] compute_theta_K timing (ms): total=" << t_total_ms
+                << ", Z-chain=" << t_chain_ms << std::endl;
+  }
   deriv_cache.grad_theta_K = grad;
   deriv_cache.grad_K_ready = true;
 }
@@ -535,6 +636,15 @@ void Latent::compute_theta_mu(bool need_grad, bool rao_blackwell) {
                           noise_type[1] == "normal");
     if (!purely_normal) {
       VectorXd WW = (rao_blackwell) ? cond_W : W;
+      // We do not Rao-Blackwellised over V, deliberately. With u = K WW this splits
+      // as sigma^-2 [ (u + 2 mu h) - mu V - mu h^2/V - h u/V ]: the middle
+      // terms are pure in V and could be replaced by E[.|W], but the cross
+      // term h u / V cannot, since cond_W = QQ^-1 M is itself a function of V
+      // through a solve. Averaging only part of a sum is not a
+      // Rao-Blackwellisation and carries no variance guarantee: here the
+      // pure-V terms are negatively correlated with the cross term, so
+      // replacing them removes a cancellation and the optimiser wobble on
+      // log sigma grows about threefold.
       VectorXd SV = sigma.array().pow(2).matrix().cwiseProduct(V);
       for (int l = 0; l < n_theta_mu; l++) {
         grad(l) = (V - h)
@@ -566,6 +676,7 @@ void Latent::compute_theta_sigma(bool need_grad, bool rao_blackwell) {
                   [](bool b) { return b; });
   if (!all_fixed) {
     VectorXd WW = (rao_blackwell) ? cond_W : W;
+    // Sampled V here too -- see the note in compute_theta_mu.
     VectorXd SV = sigma.array().pow(2).matrix().cwiseProduct(V);
     VectorXd V_minus_h = V - h;
     VectorXd tmp = (getK() * WW - mu.cwiseProduct(V_minus_h))
@@ -661,6 +772,9 @@ void Latent::update_each_iter(bool need_precond) {
   if (!need_full_update && !need_upgrade) {
     return;
   }
+  auto t_total_start = std::chrono::steady_clock::now();
+  long long t_noise_ms = 0, t_trace_ms = 0;
+
   UpdateOptions uopts;
   uopts.compute_K = true;
   uopts.compute_Z = true;
@@ -669,10 +783,25 @@ void Latent::update_each_iter(bool need_precond) {
   uopts.compute_d2K = need_precond;
   uopts.compute_d2Z = need_precond;
   uopts.compute_HK_trace = need_precond && !zero_trace;
+  // The operator trace is read below only under these same conditions; saying
+  // so lets update_all skip factorizing K when nothing will use it.
+  uopts.compute_trace = !fix_flag[latent_fix_theta_K] && !zero_trace;
   uopts.robust_reanalyze = robust_;
   uopts.n_trace_iter = n_trace_iter_;
+  uopts.in_polish = in_polish_;
+  uopts.block_probe = block_probe_;
   uopts.solver_type = solver_type_;
+  uopts.trace_probing = trace_probing_;
+  uopts.trace_probing_max_dist = trace_probing_max_dist_;
+  uopts.trace_probing_max_colours = trace_probing_max_colours_;
+  uopts.trace_probing_raise_budget = trace_probing_raise_budget_;
+  uopts.selinv_max_fill = selinv_max_fill_;
+  uopts.selinv_cost_ratio = selinv_cost_ratio_;
+  uopts.debug = debug;
+  uopts.nonsym_solver = nonsym_solver_;
   uopts.fix_mask_thetaK = ope->get_fix_mask_K();
+  // Fresh probes each iteration.
+  uopts.trace_seed = static_cast<unsigned int>(latent_rng());
   ope->update_all(theta_K, uopts);
 
   mu = B_mu * theta_mu;
@@ -680,6 +809,7 @@ void Latent::update_each_iter(bool need_precond) {
   nu = nu_lower_bound + (B_nu * theta_nu).array().exp();
 
   // update p,a,b, depend on nu, h
+  auto t_noise_start = std::chrono::steady_clock::now();
   for (int i = 0; i < n_noise; i++) {
     if (noise_type[i] == "normal")
       continue;
@@ -691,13 +821,21 @@ void Latent::update_each_iter(bool need_precond) {
     p_inc = VectorXd::Constant(V_size, -0.5 * dim);
     a_inc = mu.cwiseQuotient(sigma).array().pow(2);
   }
+  t_noise_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - t_noise_start)
+                   .count();
+
   // Update traces (pulled from operator)
   if (!fix_flag[latent_fix_theta_K] && !zero_trace) {
+    auto t_trace_start = std::chrono::steady_clock::now();
     VectorXd tv = ope->get_trace_trK();
     if (tv.size() == n_theta_K) {
       for (int i = 0; i < n_theta_K; ++i)
         trace[i] = tv(i);
     }
+    t_trace_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - t_trace_start)
+                     .count();
   }
 
   prevV = V;
@@ -705,11 +843,125 @@ void Latent::update_each_iter(bool need_precond) {
   state_ready_ = true;
   state_has_precond_terms_ = need_precond;
   invalidate_derivatives();
+  if (debug) {
+    auto t_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - t_total_start)
+                          .count();
+    ngme_io::out() << "[latent] update_each_iter timing (ms): total=" << t_total_ms
+                << ", noise_update=" << t_noise_ms << ", trace=" << t_trace_ms
+                << std::endl;
+  }
 }
 
 // main function for computing analytic Hessian blocks
+// The reparameterisation mixes mu, sigma and nu, so it only makes sense when
+// all three are free, stationary, and nu is unshifted.
+bool Latent::nig_std_active() const {
+  if (nig_param_mode_ == 0)
+    return false;
+  if (n_theta_mu != 1 || n_theta_sigma != 1 || n_theta_nu != 1)
+    return false;
+  if (noise_type.empty() ||
+      (noise_type[0] != "nig" && noise_type[0] != "normal_nig"))
+    return false;
+  if (nu_lower_bound != 0.0)
+    return false;
+  if (fix_flag[latent_fix_theta_mu] || fix_flag[latent_fix_theta_nu])
+    return false;
+  for (bool fixed : fix_theta_sigma_vec)
+    if (fixed)
+      return false;
+  return true;
+}
+
+// xi from Cabral sec 2.2. Because zeta* = zeta sqrt(eta) gives zeta^2 eta =
+// zeta*^2, xi depends on zeta* alone, and lies in [1/2, 1].
+static inline double nig_xi(double zstar) {
+  const double z2 = zstar * zstar;
+  return 1.0 + z2 - std::fabs(zstar) * std::sqrt(1.0 + z2);
+}
+
+// native (mu, log sigma, log nu) -> t
+VectorXd Latent::nig_std_from_native() const {
+  const double mu_v = theta_mu(0);
+  const double sigma_v = std::exp(theta_sigma(0));
+  const double nu_v = std::exp(theta_nu(0));
+  const double eta = 1.0 / nu_v;
+  const double zeta = mu_v / sigma_v;
+  VectorXd t(3);
+  t(0) = std::log(std::sqrt(sigma_v * sigma_v + mu_v * mu_v * eta));
+  if (nig_param_mode_ == 1) {
+    t(1) = zeta;
+    t(2) = std::log(eta);
+  } else {
+    const double zstar = zeta * std::sqrt(eta);
+    const double xi = nig_xi(zstar);
+    t(1) = (nig_param_mode_ == 3) ? std::asinh(zstar) : zstar;
+    t(2) = std::log(eta / (xi * xi));
+  }
+  return t;
+}
+
+// t -> (theta_mu, theta_sigma, theta_nu)
+VectorXd Latent::nig_native_from_t(const VectorXd &t) const {
+  const double sm = std::exp(t(0));
+  double zeta, eta;
+  if (nig_param_mode_ == 1) {
+    zeta = t(1);
+    eta = std::exp(t(2));
+  } else {
+    // mode 3 puts zeta* on an asinh scale. xi -> 1/2 as |zeta*| grows, so the
+    // excess kurtosis saturates at ~36 and the likelihood is flat out there;
+    // asinh is linear near 0 and logarithmic in the tail, which matches that
+    // sensitivity. Note zeta* = sinh(w) is exactly psi = tanh(w) under the
+    // identity xi = 1/(1 + |psi|), psi = zeta*/sqrt(1 + zeta*^2).
+    const double zstar = (nig_param_mode_ == 3) ? std::sinh(t(1)) : t(1);
+    const double xi = nig_xi(zstar);
+    eta = std::exp(t(2)) * xi * xi;   // eta = eta* xi^2
+    zeta = zstar / std::sqrt(eta);
+  }
+  const double D2 = 1.0 + zeta * zeta * eta;
+  const double sigma_v = sm / std::sqrt(D2);
+  VectorXd out(3);
+  out(0) = zeta * sigma_v;        // theta_mu = mu
+  out(1) = std::log(sigma_v);     // theta_sigma = log sigma
+  out(2) = -std::log(eta);        // theta_nu = log nu = -log eta
+  return out;
+}
+
+void Latent::nig_std_to_native(const VectorXd &t, double &theta_mu_out,
+                               double &theta_sigma_out,
+                               double &theta_nu_out) const {
+  VectorXd v = nig_native_from_t(t);
+  theta_mu_out = v(0);
+  theta_sigma_out = v(1);
+  theta_nu_out = v(2);
+}
+
+MatrixXd Latent::nig_std_jacobian() const {
+  VectorXd t = nig_std_from_native();
+  MatrixXd J(3, 3);
+  for (int j = 0; j < 3; ++j) {
+    const double st = 1e-6 * std::max(1.0, std::fabs(t(j)));
+    VectorXd tp = t, tm = t;
+    tp(j) += st;
+    tm(j) -= st;
+    J.col(j) = (nig_native_from_t(tp) - nig_native_from_t(tm)) / (2.0 * st);
+  }
+  return J;
+}
+
 void Latent::compute_hessian_blocks(bool rao_blackwell) {
   (void)rao_blackwell;
+  // The Hessian is evaluated at the DRAWN W, not at cond_W = E[W|Y], even
+  // though the gradient uses cond_W. That asymmetry is deliberate: H_K below
+  // is QUADRATIC in W, so E[H(W)|Y] != H(E[W|Y]). The gap is
+  //     tr(dK_k^T D^-1 dK_j Cov(W|Y)) + tr(K^T D^-1 d2K_jk Cov(W|Y)),
+  // and where the GRADIENT pays for the matching correction explicitly (see
+  // compute_rb_trace, which adds tr(QQ^-1 dK_j^T D^-1 K)), the Hessian has no
+  // such term. Evaluating at a draw is therefore unbiased for E[H|Y] while
+  // substituting the mean is not.
+  const VectorXd &HW = W;
   // Initialize blocks
   if (n_theta_K > 0) {
     hess_cache.H_K = MatrixXd::Zero(n_theta_K, n_theta_K);
@@ -733,24 +985,43 @@ void Latent::compute_hessian_blocks(bool rao_blackwell) {
     hess_cache.H_mu_sigma = MatrixXd::Zero(n_theta_mu, n_theta_sigma);
   }
 
+  // theta_sigma keeps every component of B_sigma, but the optimizer carries
+  // only the unfixed ones, and the gradient is compressed to those. The
+  // sigma-side Hessian blocks are naturally assembled at the full width of
+  // B_sigma, so they have to be compressed to the same set. Without this they
+  // are silently cut down to their leading corner when they are written into
+  // the preconditioner, which is the wrong curvature unless the free
+  // components happen to come first.
+  std::vector<int> sigma_free;
+  if ((int)fix_theta_sigma_vec.size() == (int)B_sigma.cols()) {
+    for (int i = 0; i < (int)fix_theta_sigma_vec.size(); ++i)
+      if (!fix_theta_sigma_vec[i])
+        sigma_free.push_back(i);
+  } else {
+    for (int i = 0; i < (int)B_sigma.cols(); ++i)
+      sigma_free.push_back(i);
+  }
+  const int n_sigma_free = (int)sigma_free.size();
+
   // Common terms
   VectorXd Dinv =
       (sigma.array().square().matrix().cwiseProduct(V)).cwiseInverse();
   VectorXd m = mu.cwiseProduct(V - h);
-  VectorXd r = getK() * W - m;
+  VectorXd r = getK() * HW - m;
+
+  std::vector<VectorXd> KjW(n_theta_K > 0 ? n_theta_K : 0);
+  for (int j = 0; j < n_theta_K; ++j)
+    KjW[j] = get_dK(j) * HW;
 
   // H_K: W|V contribution exact; add operator-side trace terms later; Y|W
   // handled in Block
   if (n_theta_K > 0) {
-    std::vector<VectorXd> KjW(n_theta_K);
-    for (int j = 0; j < n_theta_K; ++j)
-      KjW[j] = get_dK(j) * W;
     for (int j = 0; j < n_theta_K; ++j) {
       for (int k = j; k < n_theta_K; ++k) {
         double term_vec = -KjW[k].cwiseProduct(Dinv).dot(KjW[j]);
         const auto &Kjk = ope->get_d2K(j, k);
         if (Kjk.rows() > 0) {
-          VectorXd KjkW = Kjk * W;
+          VectorXd KjkW = Kjk * HW;
           term_vec += -r.cwiseProduct(Dinv).dot(KjkW);
         }
         hess_cache.H_K(j, k) = term_vec;
@@ -763,19 +1034,18 @@ void Latent::compute_hessian_blocks(bool rao_blackwell) {
     if (HKtr.rows() == n_theta_K && HKtr.cols() == n_theta_K) {
       hess_cache.H_K += HKtr;
     }
-    hess_cache.H_K.diagonal().array() += 1e-9; // small regularization
+    // Same convention as above: subtract to ridge the information.
+    hess_cache.H_K.diagonal().array() -= 1e-9;
   }
 
   // H_K_mu cross block from W|V: B^T diag(V-h) D K_j W (per j)
   if (n_theta_K > 0 && n_theta_mu > 0) {
     hess_cache.H_K_mu.setZero(n_theta_K, n_theta_mu);
-    VectorXd Dinv =
-        (sigma.array().square().matrix().cwiseProduct(V)).cwiseInverse();
+    // Dinv was recomputed here, shadowing the identical one above.
     VectorXd diagVH =
         (V - h).cwiseProduct(Dinv); // elementwise (V-h)/(sigma^2 V)
     for (int j = 0; j < n_theta_K; ++j) {
-      VectorXd KjW = get_dK(j) * W;          // n x 1
-      VectorXd z = diagVH.cwiseProduct(KjW); // n x 1
+      VectorXd z = diagVH.cwiseProduct(KjW[j]); // n x 1
       VectorXd row = B_mu.transpose() * z;   // n_theta_mu x 1
       hess_cache.H_K_mu.row(j) = row.transpose();
     }
@@ -785,10 +1055,10 @@ void Latent::compute_hessian_blocks(bool rao_blackwell) {
   if (n_theta_K > 0 && n_theta_sigma > 0) {
     hess_cache.H_K_sigma.setZero(n_theta_K, n_theta_sigma);
     for (int j = 0; j < n_theta_K; ++j) {
-      VectorXd KjW = get_dK(j) * W;                        // n x 1
-      VectorXd z = r.cwiseProduct(Dinv).cwiseProduct(KjW); // n x 1
-      VectorXd row = 2.0 * B_sigma.transpose() * z;        // n_theta_sigma x 1
-      hess_cache.H_K_sigma.row(j) = row.transpose();
+      VectorXd z = r.cwiseProduct(Dinv).cwiseProduct(KjW[j]); // n x 1
+      VectorXd row = 2.0 * B_sigma.transpose() * z;  // full B_sigma width
+      for (int i = 0; i < n_sigma_free && i < n_theta_sigma; ++i)
+        hess_cache.H_K_sigma(j, i) = row(sigma_free[i]);
     }
   }
 
@@ -802,7 +1072,12 @@ void Latent::compute_hessian_blocks(bool rao_blackwell) {
   // H_sigma: - B_sigma^T diag( 2 (r.^2) / (sigma^2 V) ) B_sigma
   if (n_theta_sigma > 0) {
     VectorXd wsig = 2.0 * r.array().square().matrix().cwiseProduct(Dinv);
-    hess_cache.H_sigma = -(B_sigma.transpose() * wsig.asDiagonal() * B_sigma);
+    MatrixXd H_sigma_full =
+        -(B_sigma.transpose() * wsig.asDiagonal() * B_sigma);
+    hess_cache.H_sigma = MatrixXd::Zero(n_theta_sigma, n_theta_sigma);
+    for (int a = 0; a < n_sigma_free && a < n_theta_sigma; ++a)
+      for (int b = 0; b < n_sigma_free && b < n_theta_sigma; ++b)
+        hess_cache.H_sigma(a, b) = H_sigma_full(sigma_free[a], sigma_free[b]);
   }
 
   // H_mu_sigma cross: -2 B_sigma^T diag( (Kz ⊙ (V-h)) / (σ^2 ⊙ V) ) B_mu
@@ -811,7 +1086,9 @@ void Latent::compute_hessian_blocks(bool rao_blackwell) {
     // The provided form is d^2/d(theta_sigma d theta_mu^T) = -2 B_sigma^T
     // diag(...) B_mu Our cache stores mu x sigma; so take transpose
     MatrixXd H_sigma_mu = -(B_sigma.transpose() * wms.asDiagonal() * B_mu);
-    hess_cache.H_mu_sigma = H_sigma_mu.transpose(); // (mu x sigma)
+    hess_cache.H_mu_sigma = MatrixXd::Zero(n_theta_mu, n_theta_sigma);
+    for (int a = 0; a < n_sigma_free && a < n_theta_sigma; ++a)
+      hess_cache.H_mu_sigma.col(a) = H_sigma_mu.row(sigma_free[a]).transpose();
   }
   // H_nu: NIG prior contribution (no cross terms)
   if (n_theta_nu > 0 && !fix_flag[latent_fix_theta_nu]) {
@@ -840,12 +1117,6 @@ void Latent::compute_hessian_blocks(bool rao_blackwell) {
       hess_cache.H_nu = -hess_cache.H_nu;
     }
   }
-
-  if (n_theta_sigma > 0)
-    hess_cache.H_sigma.diagonal().array() += 1e-6;
-  if (n_theta_nu > 0)
-    hess_cache.H_nu.diagonal().array() += 1e-6;
-  hess_cache.ready = true;
 }
 
 MatrixXd Latent::preconditioner() const {

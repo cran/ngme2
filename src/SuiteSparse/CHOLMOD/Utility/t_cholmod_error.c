@@ -11,6 +11,21 @@
 #include "cholmod_internal.h"
 
 //------------------------------------------------------------------------------
+// MESSAGE macro: print a message using the given printf function pointer
+//------------------------------------------------------------------------------
+
+#define MESSAGE(kind)                                           \
+{                                                               \
+    printf_function ("CHOLMOD " kind ":") ;                     \
+    if (message != NULL) printf_function (" %s.", message) ;    \
+    if (file    != NULL) printf_function (" file: %s", file) ;  \
+    if (line    >  0   ) printf_function (" line: %d", line) ;  \
+    printf_function ("\n") ;                                    \
+    fflush (stdout) ;                                           \
+    fflush (stderr) ;                                           \
+}
+
+//------------------------------------------------------------------------------
 // cholmod_error
 //------------------------------------------------------------------------------
 
@@ -45,6 +60,28 @@ int CHOLMOD(error)
     {
 
         //----------------------------------------------------------------------
+        // print the error message, if permitted
+        //----------------------------------------------------------------------
+
+        #ifndef NPRINT
+        int (*printf_function) (const char *, ...) ;
+        printf_function = SuiteSparse_config_printf_func_get ( ) ;
+        if (printf_function != NULL)
+        {
+            if (status > 0 && Common->print > 1)
+            {
+                // print a warning message
+                MESSAGE ("warning") ;
+            }
+            else if (Common->print > 0)
+            {
+                // print an error message
+                MESSAGE ("error") ;
+            }
+        }
+        #endif
+
+        //----------------------------------------------------------------------
         // call the user error handler, if present
         //----------------------------------------------------------------------
 
@@ -60,3 +97,4 @@ int CHOLMOD(error)
 
     return (TRUE) ;
 }
+

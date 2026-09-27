@@ -78,17 +78,60 @@ test_that("f compiles operator priors from new API", {
   )
 })
 
-test_that("f sets default nu prior to inv.exponential using median(h)", {
+test_that("prior_pc_nu calibrates lambda from P(1/nu > U) = alpha", {
+  # Cabral, Bolin & Rue (2023), Sec 3.3: lambda = -log(alpha) / U.
+  expect_equal(prior_pc_nu(U = 1, alpha = 0.05)$hyper[["lambda"]], -log(0.05))
+  expect_equal(prior_pc_nu(U = 2, alpha = 0.01)$hyper[["lambda"]], -log(0.01) / 2)
+  expect_equal(prior_pc_nu()$dist, "inv.exponential")
+  expect_error(prior_pc_nu(U = 0))
+  expect_error(prior_pc_nu(alpha = 0))
+  expect_error(prior_pc_nu(alpha = 1))
+})
+
+test_that("prior_pc_nu defaults are settable through options", {
+  withr::with_options(
+    list(ngme2.pc_nu_U = 2, ngme2.pc_nu_alpha = 0.01),
+    expect_equal(prior_pc_nu()$hyper[["lambda"]], -log(0.01) / 2)
+  )
+  # and revert once the option is gone
+  expect_equal(prior_pc_nu()$hyper[["lambda"]], -log(0.01) / 2.5)
+})
+
+test_that("f sets the default nu prior from the PC calibration, not from h", {
   fit <- f(
     map = 1:20,
     model = ar1(),
     noise = noise_nig()
   )
-
   expect_equal(fit$noise$prior_nu$type, "inv.exponential")
   expect_equal(fit$noise$prior_nu$target, "coef")
-  expect_equal(fit$noise$prior_nu$param[1], log(2), tolerance = 1e-12)
+  expect_equal(fit$noise$prior_nu$param[1], -log(0.01) / 2.5, tolerance = 1e-12)
   expect_equal(fit$noise$prior_nu$param[2], 0)
+})
+
+test_that("the default nu prior does not depend on the size of the domain", {
+  # nu is a property of the process: observing more of it must not move the
+  # prior, so lambda has to be free of any domain-extent term.
+  lams <- vapply(c(20, 40, 80, 160), function(n) {
+    f(map = 1:n, model = ar1(), noise = noise_nig())$noise$prior_nu$param[1]
+  }, numeric(1))
+  expect_equal(max(lams) / min(lams), 1, tolerance = 1e-12)
+})
+
+test_that("the default nu prior is invariant to mesh refinement", {
+  skip_on_cran()
+  skip_if_not_installed("fmesher")
+  # The same domain at three resolutions must give (nearly) the same lambda.
+  loc <- withr::with_seed(3, matrix(runif(600 * 2), 600, 2))
+  d <- data.frame(c1 = loc[, 1], c2 = loc[, 2])
+  lams <- vapply(c(0.13, 0.075, 0.045), function(ct) {
+    msh <- fmesher::fm_mesh_2d(loc = loc, cutoff = ct,
+                               max.edge = c(ct * 2.5, ct * 8))
+    fit <- f(~ c1 + c2, model = matern(mesh = msh), noise = noise_nig(), data = d)
+    fit$noise$prior_nu$param[1]
+  }, numeric(1))
+  # node counts differ several-fold, so this is a real test of the invariance
+  expect_lt(max(lams) / min(lams), 1.1)
 })
 
 test_that("f keeps explicit nu prior and does not override it", {

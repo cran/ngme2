@@ -1,6 +1,8 @@
 // implement the Ngme class and rand effect class
 #include "ngme.h"
+#include "include/phase_timing.h"
 
+#include "include/thread_io.h"
 #include <atomic>
 
 #ifdef _OPENMP
@@ -66,19 +68,53 @@ void Ngme::compute(bool with_precond, double eps) {
     precond_valid_ = false;
   }
   if (sampling_strategy == Strategy::all) {
+    VectorXd grad_acc = VectorXd::Zero(n_params);
+    MatrixXd precond_acc = with_precond
+                               ? MatrixXd::Zero(n_params, n_params)
+                               : MatrixXd::Zero(0, 0);
+    std::atomic<bool> compute_failed(false);
+    std::string compute_error;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(num_threads_repl)        \
+    reduction(vec_plus : grad_acc) reduction(mat_plus : precond_acc)
+#endif
     for (int i = 0; i < n_repl; i++) {
-      ngme_repls[i]->compute_grad_and_hessian(with_precond, eps);
-      last_grad_ += ngme_repls[i]->get_gradient();
-      if (with_precond)
-        last_precond_ += ngme_repls[i]->get_preconditioner();
+      if (compute_failed.load(std::memory_order_relaxed))
+        continue;
+      try {
+        ngme_repls[i]->compute_grad_and_hessian(with_precond, eps);
+        grad_acc += ngme_repls[i]->get_gradient();
+        if (with_precond)
+          precond_acc += ngme_repls[i]->get_preconditioner();
+      } catch (const std::exception &e) {
+#pragma omp critical(ngme_parallel_exception)
+        {
+          if (!compute_failed.load(std::memory_order_relaxed))
+            compute_error = e.what();
+          compute_failed.store(true, std::memory_order_relaxed);
+        }
+      }
     }
+    if (compute_failed.load(std::memory_order_relaxed))
+      throw std::runtime_error(compute_error);
+    last_grad_ = grad_acc;
+    if (with_precond)
+      last_precond_ = precond_acc;
   } else { // ws
     int idx = weighted_sampler(gen);
     sync_repl_if_needed(idx, with_precond);
     ngme_repls[idx]->compute_grad_and_hessian(with_precond, eps);
-    last_grad_ = ngme_repls[idx]->get_gradient();
+    // Replicate idx is drawn with probability p_idx = n_idx / N, so the raw
+    // single-replicate gradient estimates sum_i p_i g_i, not sum_i g_i as the
+    // "all" branch does. Without the 1/p_idx importance weight the two
+    // strategies differ in scale by roughly n_repl, which silently rescales the
+    // effective step size when the strategy is switched.
+    double w = 1.0;
+    if (num_each_repl[idx] > 0 && sum_num_each_repl > 0)
+      w = sum_num_each_repl / num_each_repl[idx];
+    last_grad_ = w * ngme_repls[idx]->get_gradient();
     if (with_precond)
-      last_precond_ = ngme_repls[idx]->get_preconditioner();
+      last_precond_ = w * ngme_repls[idx]->get_preconditioner();
   }
   grad_valid_ = true;
   if (with_precond) {
@@ -86,6 +122,7 @@ void Ngme::compute(bool with_precond, double eps) {
   }
   mark_computed();
 }
+
 
 MatrixXd Ngme::precond() {
   if (!grad_valid_)
@@ -139,6 +176,7 @@ VectorXd Ngme::get_parameter() {
 }
 
 void Ngme::set_parameter_and_update(const VectorXd &p, bool with_precond) {
+  ngme_timing::Scope _sp(ngme_timing::set_param_us());
   current_param_ = p;
   if (sampling_strategy == Strategy::ws) {
     std::fill(repl_dirty_.begin(), repl_dirty_.end(),
@@ -186,6 +224,8 @@ void Ngme::set_parameter_and_update(const VectorXd &p, bool with_precond) {
   }
 
   // set the different parameter for each random effect
+  if (debug)
+    ngme_io::out() << "set_parameter() in ngme class" << std::endl;
   // Invalidate caches
   grad_valid_ = false;
   precond_valid_ = false;

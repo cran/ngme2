@@ -350,7 +350,9 @@ ngme_batch_ci <- function(
 #' @param t0 non-negative schedule offset in
 #'   \eqn{\eta_t = \eta_0 (t + t0)^{-\alpha}}.
 #' @param start_sd standard deviation for randomized chain initialization.
-#' @param seed random seed for CI-stage optimization.
+#' @param seed random seed for CI-stage optimization. Defaults to a seed drawn
+#'   from the current R random number stream, so \code{set.seed()} makes the
+#'   result reproducible.
 #' @param verbose logical; print optimization progress.
 #' @param level confidence level for CI.
 #' @param name parameter block for CI (`"all"`, latent name, or `"general"`).
@@ -380,7 +382,7 @@ compute_ngme_ci <- function(
     n_parallel_chain = 4,
     t0 = 1,
     start_sd = 0.2,
-    seed = Sys.time(),
+    seed = ngme_random_seed(),
     verbose = FALSE,
     level = 0.95,
     name = "all",
@@ -444,8 +446,7 @@ compute_ngme_ci <- function(
   )
 
   if (isTRUE(control_opt$trend_std_conv_check) ||
-    isTRUE(control_opt$R_hat_conv_check) ||
-    isTRUE(control_opt$pflug_conv_check)) {
+    isTRUE(control_opt$R_hat_conv_check)) {
     warning(
       "Convergence diagnostics are enabled in `control_opt`; early stopping may reduce fixed-iteration Xi-style validity.",
       call. = FALSE
@@ -517,7 +518,9 @@ compute_ngme_CI <- compute_ngme_ci
 #' @param alpha polynomial schedule exponent used by `poly_decay(alpha, t0)`.
 #' @param t0 non-negative schedule offset.
 #' @param start_sd standard deviation for randomized chain initialization.
-#' @param seed random seed for SGLD stage.
+#' @param seed random seed for SGLD stage. Defaults to a seed drawn from the
+#'   current R random number stream, so \code{set.seed()} makes the result
+#'   reproducible.
 #' @param verbose logical; print optimization progress.
 #' @param name parameter block to extract: `"all"` (default), latent model name,
 #'   or `"general"`.
@@ -550,7 +553,7 @@ compute_ngme_sgld_samples <- function(
     alpha = 0.6,
     t0 = 10,
     start_sd = 0.2,
-    seed = Sys.time(),
+    seed = ngme_random_seed(),
     verbose = FALSE,
     name = "all",
     burnin_iter = 0,
@@ -601,7 +604,6 @@ compute_ngme_sgld_samples <- function(
           store_traj = TRUE,
           trend_std_conv_check = FALSE,
           R_hat_conv_check = FALSE,
-          pflug_conv_check = FALSE,
           stepsize_control = poly_decay(
             alpha = alpha,
             t0 = t0,
@@ -628,8 +630,7 @@ compute_ngme_sgld_samples <- function(
   )
 
   if (isTRUE(control_opt$trend_std_conv_check) ||
-    isTRUE(control_opt$R_hat_conv_check) ||
-    isTRUE(control_opt$pflug_conv_check)) {
+    isTRUE(control_opt$R_hat_conv_check)) {
     warning(
       "Convergence diagnostics are enabled in `control_opt`; early stopping may reduce fixed-iteration sampling consistency.",
       call. = FALSE

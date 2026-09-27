@@ -1,7 +1,7 @@
 test_that("control_opt_batch_ci sets recommended CI defaults", {
   ctl <- control_opt_batch_ci(
     iterations = 400,
-    n_batch = 10,
+    iters_per_check = 40,
     n_parallel_chain = 3,
     alpha = 0.6,
     t0 = 5,
@@ -10,13 +10,14 @@ test_that("control_opt_batch_ci sets recommended CI defaults", {
 
   expect_s3_class(ctl, "control_opt")
   expect_equal(ctl$iterations, 400)
+  # n_batch is derived from the checkpoint interval now that it is deprecated
+  expect_equal(ctl$iters_per_check, 40)
   expect_equal(ctl$n_batch, 10)
   expect_equal(ctl$n_parallel_chain, 3)
 
   expect_true(isTRUE(ctl$store_traj))
   expect_false(isTRUE(ctl$trend_std_conv_check))
   expect_false(isTRUE(ctl$R_hat_conv_check))
-  expect_false(isTRUE(ctl$pflug_conv_check))
   expect_equal(ctl$stepsize_decay, "none")
 
   expect_equal(ctl$stepsize_schedule, "poly")

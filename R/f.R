@@ -1,3 +1,21 @@
+#' Name of the function a call invokes, unqualified.
+#'
+#' `quote(bv(...))[[1]]` is the symbol `bv`, but `quote(ngme2::bv(...))[[1]]` is
+#' a call to `::`, and `as.character()` on that yields three elements. This
+#' returns the bare function name for both forms, and `""` for anything else
+#' (an anonymous function, a call built by `do.call`, ...), so callers can
+#' compare it against a name with `%in%` and get a single logical.
+#' @noRd
+.call_fun_name <- function(cl) {
+  if (!is.call(cl)) return("")
+  fn <- cl[[1]]
+  if (is.call(fn) && length(fn) == 3L &&
+      as.character(fn[[1]]) %in% c("::", ":::")) {
+    fn <- fn[[3]]
+  }
+  if (is.symbol(fn)) as.character(fn) else ""
+}
+
 #' Specifying a latent process model (wrapper function for each model)
 #'
 #' Function used for defining of smooth and spatial terms
@@ -9,6 +27,14 @@
 #' @param model  an \code{ngme_operator} or \code{ngme_operator_def} created by
 #'   model constructors such as \code{ar1()}, \code{matern()}, \code{bv()}, etc.
 #' @param noise  ngme_noise object, noise_nig() or noise_gal()
+#'   For a stationary \code{nig} or \code{normal_nig} noise whose \code{nu}
+#'   prior was not set by the user, \code{f()} installs the penalised-complexity
+#'   prior of \code{\link{prior_pc_nu}} on \code{nu}, that is
+#'   \eqn{1/\nu \sim \mathrm{Exp}(\lambda)} with \eqn{\lambda} calibrated from
+#'   \eqn{\Pr(1/\nu > U) = \alpha}. The rate does not depend on the mesh or on
+#'   the size of the domain; change it with
+#'   \code{options(ngme2.pc_nu_U =, ngme2.pc_nu_alpha =)} or by passing
+#'   \code{priors(nu = prior_pc_nu(...))} to the noise.
 #' @param name   name of the field, for later use, if not provided, will be "field1" etc.
 #' @param data      specifed or inherit from ngme() function
 #' @param group   group factor indicate resposne variable, can be inherited from ngme() function, (used for bivariate model)
@@ -74,7 +100,7 @@ f <- function(
     FALSE
   }
 
-  maybe_apply_default_nu_prior <- function(noise_obj, h_vec) {
+  maybe_apply_default_nu_prior <- function(noise_obj) {
     if (isTRUE(noise_obj$fix_theta_nu) || noise_obj$n_theta_nu == 0) {
       return(noise_obj)
     }
@@ -89,20 +115,11 @@ f <- function(
       return(noise_obj)
     }
 
-    h_star <- stats::median(h_vec, na.rm = TRUE)
-    if (!is.finite(h_star) || h_star <= 0) {
-      return(noise_obj)
-    }
-
-    lambda <- log(2) / h_star
-    if (!is.finite(lambda) || lambda <= 0) {
-      return(noise_obj)
-    }
-
+    # PC prior of Cabral, Bolin and Rue (2023) for the flexibility parameter
+    # eta = 1/nu: their Corollary 3.1.1 gives distance-to-Gaussian proportional
+    # to eta, hence eta ~ Exp(lambda), calibrated from P(eta > U) = alpha.
     lower <- if (!is.null(noise_obj$nu_lower_bound)) noise_obj$nu_lower_bound else 0
-    noise_obj$prior_nu <- as_internal_prior(
-      prior_inv_exp(lambda = lambda, lower = lower, target = "coef")
-    )
+    noise_obj$prior_nu <- as_internal_prior(prior_pc_nu(lower = lower))
     noise_obj
   }
 
@@ -111,9 +128,14 @@ f <- function(
   # If the user builds a bv/bv2/bv_matern model inline and all noises are normal,
   # ensure fix_theta = TRUE in that model call.
   model_expr <- substitute(model)
-  # Check if model is a call to bv/bv2/bv_matern
+  # Check if model is a call to bv/bv2/bv_matern.
+  # `.call_fun_name()` rather than as.character(): the function position of a
+  # namespace-qualified call such as `ngme2::tp(...)` is itself a call to `::`,
+  # so as.character() returns c("::", "ngme2", "tp") and the `%in%` below became
+  # a length-3 condition, which `if` rejects outright. Any qualified constructor
+  # with all-normal noise therefore failed with "the condition has length > 1".
   if (noise_all_normal && is.call(model_expr)) {
-    op_name <- tryCatch(as.character(model_expr[[1]]), error = function(e) "")
+    op_name <- .call_fun_name(model_expr)
     if (op_name %in% c("bv", "bv2", "bv_matern")) {
       model_list <- as.list(model_expr)
       name_vec <- names(model_list)
@@ -255,8 +277,16 @@ f <- function(
 
   # Build A matrix
   A <- if (is.null(A)) {
-    # If mesh_list is present, we defer A matrix construction for replicates
+    # If mesh_list is present, A is built per replicate further below
     if (!is.null(mesh_list)) {
+      if (is.null(replicate)) {
+        stop(
+          "A list of meshes was given to f() without replicate information, ",
+          "so the observation matrix cannot be built. Either pass ",
+          "replicate= to f(), or use ngme(..., replicate=) which selects one ",
+          "mesh of the list per replicate."
+        )
+      }
       NULL
     } else {
       ngme_build_A(model_name, mesh, map, operator, group)
@@ -582,7 +612,7 @@ f <- function(
     W <- c(W, W)
   }
 
-  noise <- maybe_apply_default_nu_prior(noise, operator$h)
+  noise <- maybe_apply_default_nu_prior(noise)
 
   operator_prior_names <- operator$param_name
   if (is.null(operator_prior_names) ||

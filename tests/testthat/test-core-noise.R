@@ -10,6 +10,7 @@ test_that("test basic mn", {
     y ~ x,
     data = data.frame(x = x, y = y),
     control_opt = control_opt(
+    warn_no_convergence = FALSE,
       iterations = 100,
       # optimizer = precond_sgd(),
       print_check_info = FALSE,
@@ -37,6 +38,7 @@ test_that("test basic mn", {
     y ~ 0,
     data = data.frame(x = x, y = y), family = noise_nig(),
     control_opt = control_opt(
+    warn_no_convergence = FALSE,
       iterations = 100,
       n_parallel_chain = 4,
       n_min_batch = 10,
@@ -52,6 +54,51 @@ test_that("test basic mn", {
   plot(noise_nig(mu = mu, nu = nu, sigma = sigma), out$replicates[[1]]$noise)
 })
 
+test_that("test ar1 + normal measurement noise", {
+  withr::local_seed(100)
+  n_obs <- 1000
+  rho <- 0.6
+  mu <- -2
+  sigma <- 1
+  nu <- 1
+  W <- simulate(f(
+    1:n_obs,
+    model = ar1(rho = rho),
+    noise = noise_nig(mu = mu, sigma = sigma, nu = nu)
+  ), seed = 100)[[1]]
+  sd(W)
+
+  x <- rexp(n_obs)
+  sigma_e <- 0.5
+  y <- W + rnorm(n_obs, sd = sigma_e)
+
+  fit <- ngme(y ~ 0 + f(1:n_obs, model = ar1(rho = rho), noise = noise_nig()),
+    data = data.frame(x = x, y = y),
+    control_opt = control_opt(
+    warn_no_convergence = FALSE,
+      seed = 100,
+      rao_blackwellization = TRUE,
+      iterations = 500,
+      optimizer = sgd(),
+      # verbose=TRUE,
+      n_parallel_chain = 4,
+      n_min_batch = 10
+    )
+  )
+  fit
+  traceplot(fit, hline = c(0.6, -2, 1, 1, sigma_e))
+
+  ar_result <- as.numeric(ngme_result(fit)$field1)
+  score <- abs((ar_result - c(rho, mu, sigma, nu)) / c(rho, mu, sigma, nu))
+  score
+  expect_true(all(score[1:3] < c(0.1, 0.2, 0.3)))
+  expect_true(score[4] < 0.8)
+
+  est_sigma_e <- ngme_result(fit)$data$sigma
+  expect_true(all(abs((est_sigma_e - sigma_e) / sigma_e) < 0.4))
+})
+
+
 test_that("test ar1 (normal) + NIG noise", {
   set.seed(100)
   n_obs <- 1000
@@ -62,7 +109,7 @@ test_that("test ar1 (normal) + NIG noise", {
     model = ar1(rho = rho),
     noise = noise_normal(sigma = sigma_ar)
   )
-  W <- simulate(model)[[1]]
+  W <- simulate(model, seed = 100)[[1]]
   sd(W)
 
   x <- rexp(n_obs)
@@ -83,6 +130,8 @@ test_that("test ar1 (normal) + NIG noise", {
     data = data.frame(x = x, y = y),
     family = noise_nig(),
     control_opt = control_opt(
+    warn_no_convergence = FALSE,
+      seed = 100,
       iterations = 1000,
       n_parallel_chain = 4,
       # optimizer = precond_sgd(),

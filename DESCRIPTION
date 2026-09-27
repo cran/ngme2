@@ -1,7 +1,7 @@
 Package: ngme2
 Type: Package
 Title: Linear Latent Non-Gaussian Models with Flexible Distributions
-Version: 0.9.8
+Version: 1.0.0
 Authors@R: c(
     person("David", "Bolin", email = "davidbolin@gmail.com", role = c("aut", "cph")),
     person("Xiaotian", "Jin", email = "xiaotian.jin@kaust.edu.sa", role =c("aut", "cre")),
@@ -44,10 +44,13 @@ LazyData: true
 Imports: Matrix, Rcpp, methods, rlang, ggplot2, graphics, fmesher,
         stats, gridExtra, withr
 LinkingTo: Rcpp, RcppEigen,
-Suggests: R.rsp, knitr, rmarkdown, testthat (>= 3.0.0), MASS, dplyr,
-        fields, inlabru, MetricGraph, rSPDE, sf, zoo, mvtnorm
+Suggests: knitr, rmarkdown, INLA, RcppEigen, sf, inlabru, dplyr, plyr,
+        MASS, grid, testthat (>= 3.0.0), xml2, splancs, lattice,
+        viridis, rSPDE, tidyr, fields, lme4, plotly, usethis, devtools,
+        MetricGraph (>= 1.1.2), zoo, mvtnorm, kableExtra, reshape2
+Additional_repositories: https://inla.r-inla-download.org/R/testing
+SystemRequirements: GNU make
 VignetteBuilder: knitr
-RoxygenNote: 7.3.2
 Config/testthat/edition: 3
 URL: https://davidbolin.github.io/ngme2/,
         https://github.com/davidbolin/ngme2
@@ -59,8 +62,9 @@ Copyright: The R package and code, and the main programs, were written
         Public License, version 3 or later. The package also includes
         bundled SuiteSparse components. For details see
         inst/COPYRIGHTS.
+Config/roxygen2/version: 8.1.0
 NeedsCompilation: yes
-Packaged: 2026-05-19 19:01:57 UTC; jinx0a
+Packaged: 2026-09-26 05:03:25 UTC; jinx
 Author: David Bolin [aut, cph],
   Xiaotian Jin [aut, cre],
   Alexandre Simas [aut],
@@ -87,4 +91,4 @@ Author: David Bolin [aut, cph],
   Alexander Chemeris [ctb, cph] (MS integer headers bundled with
     SuiteSparse)
 Repository: CRAN
-Date/Publication: 2026-05-20 07:40:02 UTC
+Date/Publication: 2026-09-27 09:00:02 UTC

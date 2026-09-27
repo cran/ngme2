@@ -355,6 +355,8 @@ bv_matern <- function(
 #' @param cc Parameter c in the SPDE.
 #' @param kappa Kappa parameter from Matern SPDE.
 #' @param lambda The spatial damping parameter.
+#' @param cc_variance_free Scale the operator with cc so that it affects the
+#'   total variance less. Default TRUE.
 #' @param fix_gamma TRUE if fix gamma (advection term), FALSE if estimate gamma.
 #' @param theta_gamma_x The x component of the advection term: \code{gamma_x = B_gamma_x \%*\% theta_gamma_x}.
 #' @param theta_gamma_y The y component of the advection term: \code{gamma_y = B_gamma_y \%*\% theta_gamma_y}.
@@ -364,6 +366,8 @@ bv_matern <- function(
 #' @param B_gamma_x_list A list of design matrices for the x component of the advection term on every time node, length(B_gamma_x_list) == nt-1.
 #' @param B_gamma_y_list A list of design matrices for the y component of the advection term on every time node, length(B_gamma_y_list) == nt-1.
 #' @param stabilization TRUE if using a stabilization term (for implicit Euler).
+#' @param stationary_init use a stationary initial distribution for the first time
+#'   slice (default TRUE).
 #'
 #' @return ngme_operator object.
 #' @export
@@ -385,12 +389,15 @@ spacetime <- function(
     B_gamma_x_list = NULL,
     B_gamma_y_list = NULL,
     # B_gamma_t = matrix(1, nrow = mesh[[1]]$n, ncol = 1),
-    stabilization = TRUE) {
+    stabilization = TRUE,
+    stationary_init = TRUE,
+    cc_variance_free = TRUE) {
   if (is.list(mesh) && length(mesh) > 0 && is.list(mesh[[1]]) && !inherits(mesh[[1]], c("inla.mesh.1d", "inla.mesh", "fm_mesh_1d", "fm_mesh_2d", "metric_graph"))) {
     return(structure(list(model = "spacetime", args = as.list(environment())), class = "ngme_operator_def"))
   }
   method <- "euler" # for now only support implicit euler
-  if (theta_gamma_x == 0 && theta_gamma_y == 0 && fix_gamma) {
+
+  if (all(theta_gamma_x == 0) && all(theta_gamma_y == 0) && fix_gamma) {
     stabilization <- FALSE
   }
 
@@ -405,7 +412,8 @@ spacetime <- function(
     "First mesh should be 1d" = fmesher::fm_manifold_dim(mesh_t) == 1,
     "Second mesh should be 2d" =
       fmesher::fm_manifold_dim(mesh_s) == 2,
-    "require package rSPDE" = requireNamespace("rSPDE", quietly = TRUE)
+    "require package rSPDE" = requireNamespace("rSPDE", quietly = TRUE),
+    "require package sf" = requireNamespace("sf", quietly = TRUE)
   )
 
   # Additional validation for shared_theta_gamma
@@ -525,7 +533,7 @@ spacetime <- function(
   build_Bs <- function(gamma_x, gamma_y) {
     Dx <- Matrix::Diagonal(x = gamma_x)
     Dy <- Matrix::Diagonal(x = gamma_y)
-    Dx %*% Bx %*% Dx + Dy %*% By %*% Dy
+    Dx %*% Bx + Dy %*% By
   }
 
   build_Bs_list <- function(gamma_x_list, gamma_y_list) {
@@ -611,10 +619,30 @@ spacetime <- function(
       # K <- rw1(1:nt)$K %x% Cs + 1/cc *
       #   Matrix::bdiag(null_matrix, diag_L)
 
-      K <- rw1(1:nt)$K %x% Cs + 1 / cc *
+      Bt <- rw1(1:nt)$K
+      if (stationary_init) {
+        Bt[1, ] <- 0
+      }
+      K <- Bt %x% Cs + 1 / cc *
         Matrix::bdiag(null_matrix, diag_L_list)
 
       K <- sqrt(cc) * K
+
+      if (stationary_init) {
+        # K_1 = gamma * M, the same sparsity and row structure as every interior
+        # block. The scale follows the AR(1) rule by matching traces,
+        #   gamma^2 = 1 - tr(N'N)/tr(M'M),
+        # which is exactly 1 - rho^2 in the scalar case.
+        Ls1 <- L_list[[1]]
+        Msp <- sqrt(cc) * Cs + Ls1 / sqrt(cc)
+        Nsp <- sqrt(cc) * Cs
+        mm <- sum(Msp@x^2)
+        g2 <- if (mm > 0) 1 - sum(Nsp@x^2) / mm else 1
+        if (!is.finite(g2) || g2 <= 0) g2 <- 1e-12
+        K1 <- sqrt(g2) * Msp
+        zero_s <- Matrix::Matrix(0, ns, ns, sparse = TRUE)
+        K <- K + Matrix::bdiag(c(list(K1), rep(list(zero_s), nt - 1)))
+      }
     }
     return(K)
   }
@@ -665,6 +693,8 @@ spacetime <- function(
     Hxy = ngme_as_sparse(Hxy),
     Hyx = ngme_as_sparse(Hyx),
     stabilization = stabilization,
+    stationary_init = stationary_init,
+    cc_variance_free = cc_variance_free,
     symmetric = FALSE,
     zero_trace = FALSE,
     param_name =

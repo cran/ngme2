@@ -9,7 +9,9 @@
 #' loo is leave-one-out,
 #' lpo is leave-percent-out, provide \code{percent} from 1 to 100
 #' custom is user-defined group, provide \code{target} and \code{data}
-#' @param seed random seed
+#' @param seed random seed. If \code{NULL} (the default), a seed is drawn
+#'   from the current R random number stream, so \code{set.seed()} makes the
+#'   result reproducible.
 #' @param N_sim integer, number of simulations (e.g., estimate MAE, MSE, .. N times)
 #' @param k integer (only for k-fold type)
 #' @param print print information during computation
@@ -26,11 +28,17 @@
 #'   \code{NULL}, the original per-group scores are computed. Example:
 #'   \code{metric = function(data) 2 * data$y["A"] + data$y["B"]}. To sum all
 #'   groups, return \code{sum(data$y)}.
+#' @param transform  maps each value to a comparison scale, element-wise, applied
+#' to the observations and to every posterior draw.
 #' @param n_gibbs_samples number of gibbs samples of latent process, used for computing CRPS, sCRPS
 #' @param n_burnin number of burnin
 #' @param test_idx a list of indices of the data (which data points to be predicted) (only for custom type)
 #' @param train_idx  a list of indices of the data (which data points to be used for re-sampling (not re-estimation)) (only for custom type)
 #' @param keep_pred logical, keep test information (pred_1, pred_2) in the return (as attributes), pred_1 and pred_2 are the prediction of the two chains
+#' @param max_num_threads cap on OpenMP threads for the scoring passes. Fitting
+#'   sets this from \code{control_opt}, but scoring does not, so a session that only
+#'   cross-validates inherits one thread per core; several concurrent runs then
+#'   oversubscribe. \code{NULL} (default) leaves the current setting untouched.
 #' @param thining_gap integer, the gap between samples for thinning, if 0, then no thinning, if 1, then keep 50\% of the samples for CRPS, sCRPS, etc.
 #' @param parallel logical, run in parallel mode
 #' @param cores_layer1 integer, number of cores for the first layer (over testing samples)
@@ -66,11 +74,13 @@ cross_validation <- function(
     percent = 0.2,
     times = 10,
     metric = NULL,
+    transform = identity,
     test_idx = NULL,
     train_idx = NULL,
     keep_pred = FALSE,
     parallel = FALSE,
     thining_gap = 1, # Used for computing CRPS, sCRPS, the gap between samples for thinning, if 0, then no thinning, if 1, then keep 50% of the samples for CRPS, sCRPS, etc.
+    max_num_threads = NULL,
     # merge_replicates = FALSE, # remove this option
     cores_layer1 = if (parallel) min(parallel::detectCores(), 2) else 1, # Limit to 2 cores for safety
     cores_layer2 = if (parallel) min(parallel::detectCores(), 2) else 1, # Limit to 2 cores for safety
@@ -106,6 +116,37 @@ cross_validation <- function(
     ngme <- lapply(ngme_chain_sets, function(chain_models) chain_models[[1]])
   } else if (!is.null(data)) {
     ngme <- lapply(ngme, rebuild_cv_model_with_data, data = data)
+  }
+
+  # A named list of functions means scales: score the same draws on each, which
+  # is checked before the per-model case because both are lists of functions.
+  # `transform` never affects sampling.
+  # Scoring never goes through estimate(), which is where fitting sets the
+  # OpenMP thread count, so without this a scoring session inherits one thread
+  # per core. Several concurrent CV runs then oversubscribe and busy-wait.
+  if (!is.null(max_num_threads)) {
+    stopifnot(is.numeric(max_num_threads), length(max_num_threads) == 1,
+              max_num_threads >= 1)
+    set_openmp_threads(as.integer(max_num_threads))
+  }
+
+  if (is.list(transform) && !is.null(names(transform)) &&
+      all(nzchar(names(transform))) &&
+      all(vapply(transform, is.function, logical(1)))) {
+    transform <- rep(list(transform), length(ngme))
+  } else if (is.list(transform)) {
+    if (length(transform) != length(ngme)) {
+      stop("If transform is an unnamed list it is one entry per model, so its ",
+           "length must equal length(ngme). For several SCALES, pass a NAMED ",
+           "list of functions instead.")
+    }
+    if (!all(vapply(transform, is.function, logical(1)))) {
+      stop("All entries of `transform` must be functions.")
+    }
+  } else if (is.function(transform)) {
+    transform <- rep(list(transform), length(ngme))
+  } else {
+    stop("transform must be a function or a list of functions")
   }
 
   # Handle metric argument: allow NULL, function, or list of functions (one per model)
@@ -180,6 +221,8 @@ cross_validation <- function(
   pred_2 <- list()
   Y_1 <- list()
   Y_2 <- list()
+  Y_1 <- list()
+  Y_2 <- list()
 
   compute_err <- if (merge_replicates) compute_err_merged_reps else compute_err_reps
   cv_message <- function(...) {
@@ -221,6 +264,7 @@ cross_validation <- function(
                     train_idx[[i]],
                     N_sim = N_sim,
                     n_gibbs_samples = n_gibbs_samples,
+                    n_burnin = n_burnin,
                     seed = seed,
                     keep_pred = keep_pred,
                     parallel = TRUE,
@@ -230,7 +274,8 @@ cross_validation <- function(
                     merge_groups = merge_groups,
                     merged_group_name = merged_group_name,
                     chain_models = chain_models,
-                    chain_combine = chain_combine
+                    chain_combine = chain_combine,
+                    transform = transform[[idx]]
                   )
                   cv_message("In test batch ", i, ":")
                   cv_message_table(result$scores)
@@ -274,6 +319,7 @@ cross_validation <- function(
               train_idx[[i]],
               N_sim = N_sim,
               n_gibbs_samples = n_gibbs_samples,
+              n_burnin = n_burnin,
               seed = seed,
               keep_pred = keep_pred,
               parallel = FALSE,
@@ -282,10 +328,17 @@ cross_validation <- function(
               merge_groups = merge_groups,
               merged_group_name = merged_group_name,
               chain_models = chain_models,
-              chain_combine = chain_combine
+              chain_combine = chain_combine,
+              transform = transform[[idx]]
             )
             scores[[i]] <- result$scores
             sd_scores[[i]] <- result$sd_scores
+            if (keep_pred) {
+              pred_1[[i]] <- result$pred_1
+              pred_2[[i]] <- result$pred_2
+              Y_1[[i]] <- result$Y_1
+              Y_2[[i]] <- result$Y_2
+            }
 
             cv_message("In test batch ", i, ":")
             cv_message_table(scores[[i]])
@@ -643,7 +696,7 @@ compute_err_merged_reps <- function(
     merged_group_name = NULL,
     chain_models = NULL,
     chain_combine = "param_mean") {
-  if (is.null(seed)) seed <- Sys.time()
+  if (is.null(seed)) seed <- ngme_random_seed()
   stopifnot("Not a ngme object." = inherits(ngme, "ngme"))
 
   test_idx <- sort(test_idx)
@@ -718,7 +771,8 @@ compute_err_reps <- function(
     merge_groups = FALSE,
     merged_group_name = NULL,
     chain_models = NULL,
-    chain_combine = "param_mean") {
+    chain_combine = "param_mean",
+    transform = identity) {
   test_idx <- sort(test_idx)
   stopifnot("Not a ngme object." = inherits(ngme, "ngme"))
   repls <- attr(ngme, "fit")$replicate
@@ -755,6 +809,7 @@ compute_err_reps <- function(
       bool_test_idx = bool_test_idx,
       N_sim = N_sim,
       n_gibbs_samples = n_gibbs_samples,
+      n_burnin = n_burnin,
       seed = seed,
       keep_pred = keep_pred,
       parallel = parallel,
@@ -764,7 +819,8 @@ compute_err_reps <- function(
       merge_groups = merge_groups,
       merged_group_name = merged_group_name,
       ngme_chain_reps = ngme_chain_reps,
-      chain_combine = chain_combine
+      chain_combine = chain_combine,
+      transform = transform
     )
     scores[[n_scores]] <- result_1rep$mean_scores
     sd_scores[[n_scores]] <- result_1rep$sd_scores
@@ -798,7 +854,8 @@ compute_err_reps <- function(
 # helper function to compute MSE, MAE, ... for each subset of target / data
 # assume test_idx and train_idx belongs to same replicate
 ##
-# A custom metric function can be supplied to combine group-wise observations and predictions into a single quantity before scoring.
+# A custom metric function can be supplied to combine group-wise observations and
+# predictions into a single quantity before scoring.
 compute_err_1rep <- function(
     ngme_1rep,
     bool_test_idx,
@@ -815,7 +872,8 @@ compute_err_1rep <- function(
     merge_groups = FALSE,
     merged_group_name = NULL,
     ngme_chain_reps = NULL,
-    chain_combine = "param_mean") {
+    chain_combine = "param_mean",
+    transform = identity) {
   stopifnot(
     "bool_<..>_idx should be a logical vector" =
       is.logical(bool_test_idx) && is.logical(bool_train_idx)
@@ -824,10 +882,6 @@ compute_err_1rep <- function(
   if (sum(bool_test_idx & bool_train_idx) > 0) {
     warning("Notice that test_idx and train_idx overlap!")
   }
-
-  # Since we revert the order of Y, now we need to
-  # revert the train and test idx to match
-  # NOT REALLY, I DID IT in the outside function!!!
 
   # Subset noise[test_idx, ] for test location
   y_data <- ngme_1rep$Y[bool_test_idx]
@@ -873,14 +927,14 @@ compute_err_1rep <- function(
   # extract A and cbind!
   A_pred_block <- Reduce(cbind, x = A_preds)
 
-  if (is.null(seed)) seed <- as.integer(Sys.time())
+  if (is.null(seed)) seed <- ngme_random_seed()
 
   scores <- pred_1 <- pred_2 <- Y_1 <- Y_2 <- list()
 
   if (parallel && requireNamespace("parallel", quietly = TRUE)) {
     scores <- parallel::mclapply(1:N_sim, function(nn) {
       s <- compute_scores(
-        ngme_1rep, n_gibbs_samples, n_burnin, seed + nn, A_pred_block, noise_test_idx, y_data, group_data, X_pred, metric, thining_gap, merge_groups, merged_group_name, ngme_chain_reps, chain_combine
+        ngme_1rep, n_gibbs_samples, n_burnin, seed + nn, A_pred_block, noise_test_idx, y_data, group_data, X_pred, metric, thining_gap, merge_groups, merged_group_name, ngme_chain_reps, chain_combine, transform
       )
       s
     }, mc.cores = num_cores)
@@ -890,7 +944,7 @@ compute_err_1rep <- function(
         {
           scores[[nn]] <- compute_scores(
             ngme_1rep, n_gibbs_samples, n_burnin, seed + nn, A_pred_block,
-            noise_test_idx, y_data, group_data, X_pred, metric, thining_gap, merge_groups, merged_group_name, ngme_chain_reps, chain_combine
+            noise_test_idx, y_data, group_data, X_pred, metric, thining_gap, merge_groups, merged_group_name, ngme_chain_reps, chain_combine, transform
           )
         },
         error = function(e) {
@@ -918,19 +972,31 @@ compute_err_1rep <- function(
 
   # Use the actual number of rows returned by scores instead of original group count
   # This handles the case where merge_groups=TRUE reduces 2 groups to 1 result
-  n_result_rows <- nrow(scores[[1]])
-  n_cols <- ncol(scores[[1]])
+  # Reduce N_sim score frames to mean/sd. Factored out so the multi-transform
+  # case reuses exactly the same reduction, once per scale.
+  .reduce_scores <- function(sc) {
+    a <- array(unlist(sc), dim = c(nrow(sc[[1]]), ncol(sc[[1]]), length(sc)))
+    m <- apply(a, c(1, 2), mean)
+    v <- apply(a, c(1, 2), sd)
+    colnames(m) <- colnames(v) <- names(sc[[1]])
+    rownames(m) <- rownames(v) <- rownames(sc[[1]])
+    list(mean_scores = m, sd_scores = v)
+  }
 
-  # compute mean and sd
-  array_3d <- array(unlist(scores),
-    dim = c(n_result_rows, n_cols, length(scores))
-  )
+  # With a list of transforms each element of `scores` is itself a named list
+  # (one frame per scale); regroup by scale, then reduce each.
+  if (is.list(scores[[1]]) && !is.data.frame(scores[[1]])) {
+    nms <- names(scores[[1]])
+    per <- lapply(nms, function(k) .reduce_scores(lapply(scores, `[[`, k)))
+    names(per) <- nms
+    return(list(mean_scores = lapply(per, `[[`, "mean_scores"),
+                sd_scores   = lapply(per, `[[`, "sd_scores"),
+                Y_1 = Y_1, Y_2 = Y_2, pred_1 = pred_1, pred_2 = pred_2))
+  }
 
-  mean_array <- apply(array_3d, c(1, 2), mean)
-  sd_array <- apply(array_3d, c(1, 2), sd)
-
-  colnames(mean_array) <- colnames(sd_array) <- names(scores[[1]])
-  rownames(mean_array) <- rownames(sd_array) <- rownames(scores[[1]])
+  red <- .reduce_scores(scores)
+  mean_array <- red$mean_scores
+  sd_array <- red$sd_scores
 
   # scores results and 2 predictions
   list(
@@ -1024,7 +1090,8 @@ compute_scores <- function(
     merge_groups = FALSE,
     merged_group_name = NULL,
     ngme_chain_reps = NULL,
-    chain_combine = "param_mean") {
+    chain_combine = "param_mean",
+    transform = identity) {
   tryCatch(
     {
       seed_int <- as.integer(abs(seed) %% 2147483647)
@@ -1117,7 +1184,8 @@ compute_scores <- function(
         group_data,
         merge_groups = merge_groups,
         merged_group_name = merged_group_name,
-        metric = metric
+        metric = metric,
+        transform = transform
       )
     },
     error = function(e) {
@@ -1218,12 +1286,33 @@ compute_pred_N <- function(
 #'   combine them into a vector-valued score
 #' @param merged_group_name optional label for the merged group
 #' @param metric optional custom metric function used to combine group-wise values before scoring
+#' @param transform element-wise map applied to the observations and to every
+#'   posterior draw before scoring, so the scores are on the transformed scale.
+#'   Applied before `metric`: `transform` changes the scale of each value,
+#'   `metric` combines values across groups, and the two compose in that order.
 compute_score_given_pred <- function(
     Y_N_1_thin, Y_N_2_thin,
     y_data, group_data,
     merge_groups = FALSE,
     merged_group_name = NULL,
-    metric = NULL) {
+    metric = NULL,
+    transform = identity) {
+  # Scale first, then aggregate. Scoring on a transformed scale means scoring
+  # transform(y) against transform(draw) for every draw.
+  # A list of transforms scores the same draws on several scales.
+  if (is.list(transform)) {
+    return(lapply(transform, function(tf)
+      compute_score_given_pred(Y_N_1_thin, Y_N_2_thin, y_data, group_data,
+                               merge_groups = merge_groups,
+                               merged_group_name = merged_group_name,
+                               metric = metric, transform = tf)))
+  }
+  if (!identical(transform, identity)) {
+    if (!is.function(transform)) stop("`transform` must be a function.")
+    y_data <- transform(y_data)
+    Y_N_1_thin <- apply_elementwise_transform(transform, Y_N_1_thin)
+    Y_N_2_thin <- apply_elementwise_transform(transform, Y_N_2_thin)
+  }
   metric_data <- prepare_metric_data(metric, y_data, Y_N_1_thin, Y_N_2_thin, group_data)
 
   y_data <- metric_data$y
@@ -1347,6 +1436,22 @@ compute_score_given_pred <- function(
   scores
 }
 
+
+# Apply an element-wise transform to a matrix of posterior draws, keeping its
+# shape. A transform that changes the number of elements is a user error worth
+# naming, since it would otherwise surface as a confusing dimension mismatch
+# deep inside the scoring code.
+apply_elementwise_transform <- function(transform, m) {
+  m <- as.matrix(m)
+  out <- transform(m)
+  out <- as.matrix(out)
+  if (!identical(dim(out), dim(m))) {
+    stop("`transform` must be element-wise: it returned a ",
+         paste(dim(out), collapse = "x"), " object for a ",
+         paste(dim(m), collapse = "x"), " input.", call. = FALSE)
+  }
+  out
+}
 
 prepare_metric_data <- function(metric, y_data, Y_N_1_thin, Y_N_2_thin, group_data) {
   samples1 <- as.matrix(Y_N_1_thin)

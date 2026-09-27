@@ -20,9 +20,7 @@
 #' @export
 precond_sgd <- function(
     stepsize = 1,
-    numerical_eps = 1e-5
-    # precond_by_diff_chain = FALSE
-    ) {
+    numerical_eps = 1e-5) {
   ret <- list(
     # sgd related
     method = "precond_sgd",
@@ -257,7 +255,7 @@ adamW <- function(
 #' @return a list of control variables for stepsize decay (used in \code{control_opt}).
 #' @export
 stepsize_decay <- function(
-    method = c("none", "grad_norm_plateau"),
+    method = c("none", "grad_norm_plateau", "trend"),
     patience = 3,
     gamma = 0.5,
     min_delta = 0,

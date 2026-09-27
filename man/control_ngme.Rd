@@ -6,6 +6,7 @@
 \usage{
 control_ngme(
   n_gibbs_samples = 5,
+  post_burnin = 100,
   fix_beta = FALSE,
   n_post_samples = 100,
   beta_init = NULL,
@@ -14,7 +15,18 @@ control_ngme(
 )
 }
 \arguments{
-\item{n_gibbs_samples}{number of gibbs samples at each iteration}
+\item{n_gibbs_samples}{number of gibbs samples at each iteration.
+Raising it lowers the variance of each gradient but costs proportionally more per
+iteration, so the number of iterations needed to satisfy the
+convergence checks is largely unchanged and the wall-clock time to
+converge goes up. Raise it when the estimates are noisy at
+convergence.}
+
+\item{post_burnin}{number of Gibbs sweeps to discard before recording the
+posterior samples of W and V returned by \code{ngme()}. A burn-in is
+needed because the chain is restarted from the stored W and V, which are
+averaged over the parallel chains and so are not themselves a draw from
+the posterior. Set to 0 only if you know the stored state is a valid draw.}
 
 \item{fix_beta}{logical, fix fixed effect estimation}
 
@@ -30,7 +42,7 @@ design scale; no manual rescaling is required.}
 
 \item{...}{additional arguments. Legacy aliases \code{feff} and
 \code{fix_feff} are still recognized and mapped to \code{beta_init} and
-\code{fix_beta}.}
+\code{fix_beta}. Anything else is ignored with a warning naming it.}
 }
 \value{
 a list of control variables for ngme

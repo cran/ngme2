@@ -23,7 +23,6 @@
 #' @param prior_beta prior specification for fixed effects (`beta`), created by
 #'   \code{prior_*()} or \code{priors(...)}.
 #' @param start  starting ngme object (usually object from last fit)
-#' @param moving_window number of iterations to average the estimation
 #' @param debug  toggle debug mode
 #'
 #' @return random effects (for different replicate) + models(fixed effects, measuremnt noise, and latent process)
@@ -54,7 +53,6 @@ ngme <- function(
     group = NULL,
     replicate = NULL,
     start = NULL,
-    moving_window = 1, # return the average estimation of last .. iterations
     prior_beta = NULL,
     debug = FALSE) {
   # -------------  CHECK INPUT ---------------
@@ -105,6 +103,15 @@ ngme <- function(
   } # ngme noise object
 
   stopifnot(class(noise) == "ngme_noise")
+  if (identical(control_opt$precond_meas_sigma, 2L) &&
+      any(noise$noise_type != "normal")) {
+    warning(
+      "control_opt(precond_meas_sigma = \"complete\") is only supported for ",
+      "Gaussian measurement noise; using \"fisher\" for the ",
+      paste(noise$noise_type, collapse = "/"), " measurement noise.",
+      call. = FALSE
+    )
+  }
 
   # parse the formula get a list of ngme_replicate
   ngme_model <- ngme_parse_formula(
@@ -120,6 +127,8 @@ ngme <- function(
   }
   attr(ngme_model, "fit") <- fit
   attr(ngme_model, "estimation_enabled") <- control_opt$estimation
+
+  if (isTRUE(control_opt$estimation)) check_arma_identifiable(ngme_model)
 
   # Check if using bfgs for non-Gaussian model
   if (control_opt$sgd_method == "bfgs") {
@@ -254,6 +263,38 @@ ngme <- function(
     message(paste(capture.output(str(ngme_model$replicates[[1]])), collapse = "\n"))
   }
 
+  continue_chains <- if (is.null(control_opt$continue_chains)) TRUE else
+    isTRUE(control_opt$continue_chains)
+  if (inherits(start, "ngme") && continue_chains) {
+    # Suppress the cold-start dispersion for every warm start, whether or not
+    # the previous fit carried per-chain parameters.
+    control_opt$warm_start_no_jitter <- TRUE
+    cp <- attr(start, "chain_params")
+    if (is.matrix(cp) && nrow(cp) >= 1) {
+      if (ncol(cp) == ngme_model$n_params) {
+        n_ch <- control_opt$n_parallel_chain
+        # fewer chains stored than requested: recycle, so the extra chains still
+        # start from real fitted states rather than from jitter
+        pick <- rep_len(seq_len(nrow(cp)), n_ch)
+        control_opt$chain_start <- cp[pick, , drop = FALSE]
+
+        cout <- attr(start, "chain_outputs")
+        if (is.list(cout) && length(cout) >= 1) {
+          control_opt$chain_ngme <- lapply(pick, function(k) {
+            m <- ngme_model
+            m$replicates <- .seed_chain_state(ngme_model$replicates, cout[[k]])
+            m
+          })
+        }
+      } else {
+        warning("`start` was fitted under a different parameterization (",
+                ncol(cp), " parameters vs ", ngme_model$n_params,
+                "); its chains cannot be continued, so the chains are ",
+                "re-initialized from the fitted values.", call. = FALSE)
+      }
+    }
+  }
+
   # configuration of controls
 
   # check all f has the same replicate
@@ -280,12 +321,13 @@ ngme <- function(
     if (isTRUE(control_opt$verbose)) {
       message("Starting posterior sampling...")
     }
+    post_burnin <- if (is.null(control_ngme$post_burnin)) 100L else control_ngme$post_burnin
     for (i in seq_along(ngme_model$replicates)) {
       res <- tryCatch(
         sampling_cpp(
           ngme_model$replicates[[i]],
           n = control_ngme$n_post_samples,
-          n_burnin = 1,
+          n_burnin = post_burnin,
           posterior = TRUE,
           seed = control_opt$seed
         ),
@@ -333,16 +375,28 @@ ngme <- function(
     if (isTRUE(control_opt$store_traj)) {
       # Transform trajectory
       traj_df_chains <- transform_traj(attr(outputs, "opt_traj"))
-      # dispatch trajs to each latent and block
+      # dispatch trajs to each latent and block. The trajectory holds one row
+      # per *free* parameter, so a component all of whose parameters are fixed
+      # owns no rows at all -- use seq_len() rather than `a:b`, which counts
+      # backwards when the range is empty and would hand the component a bogus
+      # out-of-range row plus a row belonging to its neighbour.
+      # Continue the trajectory ONLY when this fit continues the same model.
+      continue_ok <- inherits(start, "ngme") &&
+        .same_model_for_traj(start, ngme_model)
       idx <- 0
       for (i in seq_along(ngme_model$replicates[[1]]$models)) {
         n_params <- ngme_model$replicates[[1]]$models[[i]]$n_params
+        lat_rows <- idx + seq_len(n_params)
         lat_traj_chains <- list()
         for (j in seq_along(traj_df_chains)) {
-          lat_traj_chains[[j]] <- traj_df_chains[[j]][idx + 1:n_params, ]
+          lat_traj_chains[[j]] <- traj_df_chains[[j]][lat_rows, , drop = FALSE]
         }
 
-        attr(ngme_model$replicates[[1]]$models[[i]], "lat_traj") <- lat_traj_chains
+        attr(ngme_model$replicates[[1]]$models[[i]], "lat_traj") <-
+          .continue_traj(
+            if (continue_ok)
+              attr(start$replicates[[1]]$models[[i]], "lat_traj") else NULL,
+            lat_traj_chains)
         idx <- idx + n_params
       }
 
@@ -350,11 +404,23 @@ ngme <- function(
       block_traj <- list()
       n_feff <- length(ngme_model$replicates[[1]]$feff)
       n_chains <- length(traj_df_chains)
+      block_rows <- idx + seq_len(max(0, ngme_model$replicates[[1]]$n_params - idx))
       for (j in seq_len(n_chains)) {
-        block_traj[[j]] <- traj_df_chains[[j]][(idx + 1):ngme_model$replicates[[1]]$n_params, ]
+        block_traj[[j]] <- traj_df_chains[[j]][block_rows, , drop = FALSE]
       }
 
       n_block_params <- nrow(block_traj[[1]])
+      # Measurement noise rows come first. If the optimiser used the
+      # standardised NIG coordinates for them, map back to native so the
+      # trajectories read like the reported estimates.
+      merr_mode <- est_output[[1]]$merr_nig_std
+      if (!is.null(merr_mode) && merr_mode > 0 && n_block_params >= 3) {
+        for (i in seq_along(block_traj)) {
+          block_traj[[i]][1:3, ] <- ngme_nig_std_to_native(
+            as.matrix(block_traj[[i]][1:3, , drop = FALSE]), merr_mode
+          )
+        }
+      }
       # Map fixed-effects trajectories back to raw parameterization so traceplot
       # is comparable with ngme_result()/printed feff.
       if (n_feff > 0) {
@@ -386,7 +452,11 @@ ngme <- function(
         }
       }
 
-      attr(ngme_model$replicates[[1]], "block_traj") <- block_traj
+      attr(ngme_model$replicates[[1]], "block_traj") <-
+        .continue_traj(
+          if (continue_ok)
+            attr(start$replicates[[1]], "block_traj") else NULL,
+          block_traj)
       attr(outputs, "opt_traj") <- NULL
     } else {
       attr(outputs, "opt_traj") <- NULL
@@ -397,6 +467,20 @@ ngme <- function(
     } else {
       attr(ngme_model, "chain_outputs") <- NULL
     }
+    # Each chain's own final parameter vector, so a later
+    # `ngme(..., start = this)` can resume the chains where they actually are
+    # rather than at a re-jittered average of them.
+    attr(ngme_model, "chain_params") <- attr(outputs, "chain_params")
+    attr(ngme_model, "par_names") <- attr(outputs, "par_names")
+    # per-checkpoint convergence diagnostics, for choosing/auditing a stopping
+    # rule after the fact
+    cd <- attr(outputs, "conv_diag")
+    if (!is.null(cd) && nrow(cd) > 0) {
+      cd <- as.data.frame(cd)
+      pn <- attr(outputs, "par_names")
+      cd$param <- if (!is.null(pn)) pn[cd$param + 1L] else as.character(cd$param)
+      attr(ngme_model, "conv_diag") <- cd
+    }
   } else {
     # Estimation skipped: map fixed effects and X back to the raw covariate
     # scale so outputs are comparable to pre-demean runs.
@@ -406,6 +490,126 @@ ngme <- function(
     }
   }
   ngme_model
+}
+
+# Rewrite `pkg::f(...)` to `f(...)` in a formula's function positions, for the
+# names in `specials`.
+#
+# WHY. terms.formula(specials = ) identifies a special by the NAME of the
+# function being called, so `ngme2::f(x, model = ar1())` is not seen as a
+# special: its function position is a call to `::`, not the symbol `f`. The
+# term then goes down the fixed-effect path, which is a wrong answer as
+# the latent field is quietly dropped from the model.
+#
+# Only the function position is touched, so `model = ngme2::ar1()` and any
+# other qualified call inside the arguments is left exactly as written.
+#
+# Returns the (possibly unchanged) formula and the names actually rewritten, so
+# the caller can bind them for evaluation.
+.unqualify_formula_specials <- function(fm, specials) {
+  rewritten <- character(0)
+  walk <- function(x) {
+    if (!is.call(x)) return(x)
+    nm <- .call_fun_name(x)
+    if (nm %in% specials && is.call(x[[1]])) {
+      # x[[1]] is a `::`/`:::` call; replace it with the bare symbol
+      x[[1]] <- as.symbol(nm)
+      rewritten <<- c(rewritten, nm)
+    }
+    for (i in seq_along(x)) {
+      if (!is.null(x[[i]]) && !identical(x[[i]], quote(expr = ))) {
+        x[[i]] <- walk(x[[i]])
+      }
+    }
+    x
+  }
+  env <- environment(fm)
+  fm2 <- walk(fm)
+  fm2 <- stats::as.formula(fm2, env = env)
+  list(formula = fm2, rewritten = unique(rewritten))
+}
+
+# Concatenate a previous fit's trajectory with this run's, chain by chain.
+#
+# Binding is refused rather than forced when the two do not line up (a
+# different number of chains, or of parameters): a fit whose model changed is
+# not a continuation of the earlier one, and gluing the paths together would
+# produce a trajectory that never happened. In that case only the new path is
+# kept. `n_prev_iters` records where the previous path ended, so a reader can
+# tell the chunks apart.
+#' Is `start` the SAME model as the one just fitted?
+#'
+#' Trajectory continuation is only meaningful when a fit continues an earlier
+#' run of the same model.
+#'
+#' `.continue_traj()` alone cannot tell: it only sees matrices, so its shape
+#' check passes whenever the parameter counts happen to agree.
+#'
+#' @noRd
+.same_model_for_traj <- function(prev, new) {
+  if (!inherits(prev, "ngme") || !inherits(new, "ngme")) return(FALSE)
+  p <- prev$replicates[[1]]; n <- new$replicates[[1]]
+  if (is.null(p) || is.null(n)) return(FALSE)
+  # The parameter names encode the model structure, its noise families and the
+  # parameter count in one comparable vector.
+  if (!identical(p$par_names, n$par_names)) return(FALSE)
+  if (!identical(length(p$models), length(n$models))) return(FALSE)
+  if (!identical(length(p$feff), length(n$feff))) return(FALSE)
+  if (!identical(p$noise$noise_type, n$noise$noise_type)) return(FALSE)
+  sig <- function(m) vapply(m, function(x)
+    paste(x$model, x$noise_type, x$noise$noise_type, x$n_params, x$name,
+          sep = "|"), character(1))
+  identical(sig(p$models), sig(n$models))
+}
+
+.continue_traj <- function(prev, new) {
+  if (!is.list(new) || !length(new)) return(new)
+  if (!is.list(prev) || !length(prev)) return(new)
+  if (length(prev) != length(new)) return(new)
+  prev_m <- lapply(prev, as.matrix)
+  new_m <- lapply(new, as.matrix)
+  if (!all(vapply(prev_m, nrow, 1L) == vapply(new_m, nrow, 1L))) return(new)
+  out <- lapply(seq_along(new_m), function(j) cbind(prev_m[[j]], new_m[[j]]))
+  names(out) <- names(new)
+  attr(out, "n_prev_iters") <-
+    c(attr(prev, "n_prev_iters"), ncol(prev_m[[1]]))
+  out
+}
+
+# Copy ONE chain's latent state (W, and the mixing variables V) into a set of
+# replicates, leaving everything else alone.
+#
+# Deliberately NOT update_ngme_est(): that function also runs
+# ngme_restore_fixed_effect_scale(), which rewrites `feff` and `X` and is NOT
+# idempotent, so applying it to replicates that have already been seeded from
+# `start` would double-transform the fixed effects.
+#
+# Every copy is length-guarded: a mismatch means the chain state does not belong
+# to this model, and keeping the model's own W is better than pasting in a
+# vector of the wrong shape.
+.seed_chain_state <- function(repls, chain_out) {
+  if (!is.list(chain_out)) return(repls)
+  for (i in seq_along(repls)) {
+    co <- chain_out[[i]]
+    if (is.null(co)) next
+    if (!is.null(co$noise$V) &&
+        length(co$noise$V) == length(repls[[i]]$noise$V)) {
+      repls[[i]]$noise$V <- co$noise$V
+    }
+    for (j in seq_along(repls[[i]]$models)) {
+      cm <- co$models[[j]]
+      if (is.null(cm)) next
+      if (!is.null(cm$W) &&
+          length(cm$W) == length(repls[[i]]$models[[j]]$W)) {
+        repls[[i]]$models[[j]]$W <- cm$W
+      }
+      if (!is.null(cm$V) &&
+          length(cm$V) == length(repls[[i]]$models[[j]]$noise$V)) {
+        repls[[i]]$models[[j]]$noise$V <- cm$V
+      }
+    }
+  }
+  repls
 }
 
 # helper function
@@ -443,6 +647,23 @@ ngme_diag_vec <- function(x) {
     return(matrix(numeric(0), nrow = 0, ncol = 0))
   }
   diag(x, nrow = length(x), ncol = length(x))
+}
+
+# Standardised NIG coordinates (src/include/nig_std.h) -> native
+# (theta_mu, theta_sigma, theta_nu), column by column of a 3-row matrix.
+ngme_nig_std_to_native <- function(t, mode) {
+  xi <- function(z) 1 + z^2 - abs(z) * sqrt(1 + z^2)
+  sm <- exp(t[1, ])
+  if (mode == 1) {
+    zeta <- t[2, ]
+    eta <- exp(t[3, ])
+  } else {
+    zstar <- if (mode == 3) sinh(t[2, ]) else t[2, ]
+    eta <- exp(t[3, ]) * xi(zstar)^2
+    zeta <- zstar / sqrt(eta)
+  }
+  sigma <- sm / sqrt(1 + zeta^2 * eta)
+  rbind(zeta * sigma, log(sigma), -log(eta))
 }
 
 # use estimate result to update ngme object
@@ -922,6 +1143,21 @@ ngme_parse_formula <- function(
   enclos_env <- list2env(as.list(parent.frame()), parent = parent.frame(2))
   global_env_first <- list2env(as.list(parent.frame(2)), parent = parent.frame())
 
+  # `terms.formula(specials =)` matches specials BY NAME, so `ngme2::f(...)`
+  # was not recognised as a latent term at all: it fell through to the
+  # fixed-effect path and the model was fitted without the field, silently and
+  # without error. Strip the qualification from the function position of any
+  # `ngme2::f` / `ngme2::fe` call, and bind the bare name in the environments
+  # the terms are evaluated in -- so the rewrite cannot break the very case it
+  # exists for, a caller who wrote `ngme2::f` because ngme2 is not attached.
+  .unq <- .unqualify_formula_specials(fm, c("f", "fe"))
+  fm <- .unq$formula
+  for (.nm in .unq$rewritten) {
+    .fun <- get(.nm, envir = asNamespace("ngme2"))
+    assign(.nm, .fun, envir = global_env_first)
+    assign(.nm, .fun, envir = enclos_env)
+  }
+
   tf <- terms.formula(fm, specials = c("f", "fe"))
   terms <- attr(tf, "term.labels")
   intercept <- attr(tf, "intercept")
@@ -1119,19 +1355,26 @@ ngme_parse_formula <- function(
   levels <- levels(replicate)
   blocks_rep <- list() # of length n_repl
 
-  # Validate mesh lists if any f() calls use them
-  for (tmp in pre_model) {
-    if (!is.null(tmp$mesh) && is.list(tmp$mesh) && !inherits(tmp$mesh, c("inla.mesh.1d", "inla.mesh", "fm_mesh_1d", "fm_mesh_2d", "metric_graph"))) {
-      n_meshes <- length(tmp$mesh)
-      n_repls <- length(levels)
-      if (n_meshes < n_repls) {
-        stop(paste("Insufficient meshes provided for field '", tmp$name, "'. ",
-          "Expected ", n_repls, " meshes for ", n_repls, " replicates, ",
-          "but only ", n_meshes, " meshes were provided.",
-          sep = ""
-        ))
-      }
+  # Resolve and validate per-replicate mesh lists, i.g.
+  # f(t, model = rw1(mesh = ngme_make_mesh_repls(...))).
+  # The mesh lives in the operator call inside f(), so it is resolved here once
+  # and the mesh of the replicate at hand is substituted before evaluating f().
+  repl_mesh <- list()
+  for (f_name in names(pre_model)) {
+    tmp <- pre_model[[f_name]]
+    info <- resolve_f_model_mesh(tmp$model, data, global_env_first)
+    if (is.null(info) || !is_replicate_mesh_arg(info$mesh, info$model)) next
+
+    n_meshes <- length(info$mesh)
+    n_repls <- length(levels)
+    if (n_meshes < n_repls) {
+      stop(paste("Insufficient meshes provided for field '", f_name, "'. ",
+        "Expected ", n_repls, " meshes for ", n_repls, " replicates, ",
+        "but only ", n_meshes, " meshes were provided.",
+        sep = ""
+      ))
     }
+    repl_mesh[[f_name]] <- info
   }
 
   noise_new <- update_noise(noise, n = length(ngme_response))
@@ -1159,36 +1402,20 @@ ngme_parse_formula <- function(
 
     # re-evaluate each f model using idx
     models_rep <- list()
-    for (tmp in pre_model) {
+    for (f_name in names(pre_model)) {
+      tmp <- pre_model[[f_name]]
       tmp$subset <- idx
 
-      # Evaluate mesh parameter to get actual value
-      actual_mesh <- if (is.null(tmp$mesh)) NULL else eval(tmp$mesh, envir = data, enclos = global_env_first)
-
-      # Handle mesh selection for different replicates
-      if (
-        tmp$model != "spacetime" &&
-          !is.null(actual_mesh) &&
-          is.list(actual_mesh) &&
-          !inherits(actual_mesh, c("inla.mesh.1d", "inla.mesh", "fm_mesh_1d", "fm_mesh_2d", "metric_graph"))
-      ) {
-        # mesh is a list of meshes for different replicates
-        mesh_list <- actual_mesh
-
-        # Convert level to numeric index if needed
-        replicate_idx <- which(levels == level)
-
-        # Check if we have enough meshes for this replicate
-        if (replicate_idx <= length(mesh_list)) {
-          selected_mesh <- mesh_list[[replicate_idx]]
-        } else {
-          stop(paste("Not enough meshes provided for replicate", level, ". Expected at least", replicate_idx, "meshes, but only", length(mesh_list), "provided."))
-        }
-
-        # Replace the mesh parameter in the call with the selected mesh
-        tmp$mesh <- selected_mesh
-
-        # Force A matrix to be NULL so it gets rebuilt with the correct mesh
+      # Give this replicate its own mesh, so that the operator and the A matrix
+      # are built against it instead of against the whole list of meshes.
+      if (!is.null(repl_mesh[[f_name]])) {
+        info <- repl_mesh[[f_name]]
+        tmp$model <- info$set(
+          select_replicate_mesh(
+            info$mesh, level, which(levels == level), f_name
+          )
+        )
+        # the A matrix has to be rebuilt against this replicate's mesh
         tmp$A <- NULL
       }
 

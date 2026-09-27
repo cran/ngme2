@@ -9,12 +9,36 @@ sampling_cpp <- function(ngme_replicate, n, n_burnin, posterior, seed) {
     .Call(`_ngme2_sampling_cpp`, ngme_replicate, n, n_burnin, posterior, seed)
 }
 
+trace_probe_draws <- function(Q, M, n_probes, reps, probing, max_dist = 4L, min_reps = 1L, raise_cap = 0L, solver_type = 0L, seed = 1L) {
+    .Call(`_ngme2_trace_probe_draws`, Q, M, n_probes, reps, probing, max_dist, min_reps, raise_cap, solver_type, seed)
+}
+
 get_openmp_threads <- function() {
     .Call(`_ngme2_get_openmp_threads`)
 }
 
+set_openmp_threads <- function(n) {
+    .Call(`_ngme2_set_openmp_threads`, n)
+}
+
+factorization_timing <- function(reset = FALSE) {
+    .Call(`_ngme2_factorization_timing`, reset)
+}
+
 has_pardiso <- function() {
     .Call(`_ngme2_has_pardiso`)
+}
+
+ngme_factor_counters <- function(reset = FALSE) {
+    .Call(`_ngme2_ngme_factor_counters`, reset)
+}
+
+group_cv_cpp <- function(ngme_replicates, groups_per_rep, n, n_burnin, seed, num_threads, chunk_cols) {
+    .Call(`_ngme2_group_cv_cpp`, ngme_replicates, groups_per_rep, n, n_burnin, seed, num_threads, chunk_cols)
+}
+
+group_cv_exact_cpp <- function(ngme_replicates, groups_per_rep, n, n_burnin, seed, num_threads, n_chains, chain_starts) {
+    .Call(`_ngme2_group_cv_exact_cpp`, ngme_replicates, groups_per_rep, n, n_burnin, seed, num_threads, n_chains, chain_starts)
 }
 
 compute_log_like_cpp <- function(R_ngme) {

@@ -51,18 +51,29 @@ ar1 <- function(mesh = NULL, rho = 0) {
   mesh <- ngme_build_mesh(mesh)
   n <- mesh$n
   h <- c(diff(mesh$loc), 1)
+  # K = rho C + G + sqrt(1 - rho^2) E11.
+  #
+  # The (1,1) entry is the stationary initial condition of the AR(1): the first
+  # observation has marginal sd 1/sqrt(1 - rho^2), so K[1,1] must track the
+  # *current* rho. It is carried as its own matrix because the generic operator
+  # builds K as a linear combination of fixed matrices, so a coefficient is the
+  # only place a non-linear function of theta_K can live -- see the "sech"
+  # transformation, sqrt(1 - tanh(theta/2)^2).
   G <- Matrix::Diagonal(n)
-  G[1, 1] <- sqrt(1 - rho**2)
+  G[1, 1] <- 0
   C <- Matrix::sparseMatrix(j = 1:(n - 1), i = 2:n, x = -1, dims = c(n, n))
+  E11 <- Matrix::sparseMatrix(i = 1, j = 1, x = 1, dims = c(n, n))
   G <- ngme_as_sparse(G)
   C <- ngme_as_sparse(C)
+  E11 <- ngme_as_sparse(E11)
   stopifnot("The mesh should be 1d and has gap 1." = all(h == 1))
 
   theta_K <- ar1_a2th(rho)
   stopifnot("The length of rho(theta_K) should be 1." = length(theta_K) == 1)
 
   update_K <- function(theta_K) {
-    ar1_th2a(theta_K) * C + G
+    a <- ar1_th2a(theta_K)
+    a * C + G + sqrt(1 - a^2) * E11
   }
 
   # Create a generic model internally
@@ -72,11 +83,12 @@ ar1 <- function(mesh = NULL, rho = 0) {
     mesh = mesh,
     model = "ar1",
     theta_K = c(rho = g(rho)),
-    trans = c(rho = "tanh"),
-    matrices = list(C, G),
+    trans = list(rho = c("tanh", "null", "sech")),
+    matrices = list(C, G, E11),
     h = h,
     C = C,
     G = G,
+    E11 = E11,
     update_K = update_K,
     K = ngme_as_sparse(update_K(theta_K)),
     symmetric = FALSE,
@@ -210,10 +222,17 @@ arma <- function(
   # Attach spec for MA part (names for MA params now 'ma1..ma_q')
   Z_spec <- list(type = "ma", order = q, param = paste0("ma", 1:q))
 
-  # Build MA shift matrices L^k = -Cs[[k]] (since Cs has -1 on sub-diagonal positions)
+  # Build MA shift matrices L^j (1 on the j-th sub-diagonal), matching the Lpow
+  # the backend builds. These cannot be taken from Cs: Cs is indexed by the AR
+  # order and its band starts at row p + 1, so reusing it drops rows when q < p
+  # and is out of bounds altogether when q > p.
   Ls <- vector("list", max(1, q))
   if (q > 0) {
-    for (j in 1:q) Ls[[j]] <- -Cs[[j]]
+    for (j in 1:q) {
+      Ls[[j]] <- Matrix::sparseMatrix(
+        i = (j + 1):n, j = 1:(n - j), x = 1, dims = c(n, n)
+      )
+    }
   } else {
     Ls[[1]] <- Matrix::sparseMatrix(i = 1, j = 1, x = 0, dims = c(n, n))
   }
@@ -829,7 +848,7 @@ matern <- function(
   mesh <- ngme_build_mesh(mesh)
   if (fix_alpha && alpha != 2 && alpha != 4) {
     if (!requireNamespace("rSPDE", quietly = TRUE)) {
-      stop("For fixed alpha values not equal to 2 or 4, the 'rSPDE' package is required. Please install it before using this option.")
+      stop("For fixed alpha values not equal to 2 or 4, the 'rSPDE' package is required. Please install it with: install.packages('rSPDE')")
     }
   }
 
@@ -944,7 +963,9 @@ matern <- function(
     alpha = alpha,
     fix_alpha = fix_alpha,
     spatial_dim = d,
-    symmetric = TRUE,
+    # Free boundaries in a 1D mesh give a non-symmetric stiffness matrix.
+    # Its operator must use the non-symmetric solver for traces and sampling.
+    symmetric = Matrix::isSymmetric(C) && Matrix::isSymmetric(G),
     stationary = stationary,
     rational_order = rational_order,
     param_name = NULL,
@@ -1168,20 +1189,48 @@ precision_matrix_multivariate <- function(p,
 #' @export
 #' @examples
 #' library(fmesher)
-#'
-#' # Use a small mesh so the example stays lightweight.
-#' x <- seq(from = 0, to = 1, length.out = 6)
+#' library(fields)
+#' # Define mesh
+#' x <- seq(from = 0, to = 1, length.out = 40)
 #' mesh <- fm_rcdt_2d_inla(lattice = fm_lattice_2d(x, x), extend = FALSE)
-#'
-#' Q <- precision_matrix_multivariate_spde(
-#'   p = 2,
-#'   mesh = mesh,
-#'   rho = 0.25,
-#'   alpha_list = list(2, 2),
-#'   theta_K_list = list(0, 0),
-#'   variance_list = list(1, 1)
+#' # Set parameters
+#' p <- 3 # number of fields
+#' rho <- c(-0.5, 0.5, -0.25) # correlation parameters
+#' log_kappa <- list(2, 2, 2) # log(kappa)
+#' variances <- list(1, 1, 1) # set marginal variances to 1
+#' alpha <- list(2, 2, 2) # smoothness parameters
+#' # Compute precision
+#' Q <- precision_matrix_multivariate_spde(p,
+#'   mesh = mesh, rho = rho,
+#'   alpha = alpha, theta_K_list = log_kappa,
+#'   variance_list = variances
 #' )
-#' dim(Q)
+#' # Plot the cross covariances
+#' A <- as.vector(fm_basis(mesh, loc = matrix(c(0.5, 0.5), 1, 2)))
+#' Sigma <- as.vector(solve(Q, c(A, rep(0, 2 * mesh$n))))
+#' r11 <- Sigma[1:mesh$n]
+#' r12 <- Sigma[(mesh$n + 1):(2 * mesh$n)]
+#' r13 <- Sigma[(2 * mesh$n + 1):(3 * mesh$n)]
+#' Sigma <- as.vector(solve(Q, c(rep(0, mesh$n), A, rep(0, mesh$n))))
+#' r22 <- Sigma[(mesh$n + 1):(2 * mesh$n)]
+#' r23 <- Sigma[(2 * mesh$n + 1):(3 * mesh$n)]
+#' Sigma <- as.vector(solve(Q, v <- c(rep(0, 2 * mesh$n), A)))
+#' r33 <- Sigma[(2 * mesh$n + 1):(3 * mesh$n)]
+#'
+#' proj <- fm_evaluator(mesh)
+#'
+#' oldpar <- par(no.readonly = TRUE)
+#' par(mfrow = c(3, 3))
+#' image.plot(fm_evaluate(proj, r11), main = "Cov(X_1(s0),X_1(s)")
+#' plot.new()
+#' plot.new()
+#' image.plot(fm_evaluate(proj, r12), main = "Cov(X_1(s0),X_2(s)")
+#' image.plot(fm_evaluate(proj, r22), main = "Cov(X_2(s0),X_2(s)")
+#' plot.new()
+#' image.plot(fm_evaluate(proj, r13), main = "Cov(X_1(s0),X_3(s)")
+#' image.plot(fm_evaluate(proj, r23), main = "Cov(X_2(s0),X_3(s)")
+#' image.plot(fm_evaluate(proj, r33), main = "Cov(X_3(s0),X_3(s)")
+#' par(oldpar)
 precision_matrix_multivariate_spde <- function(
     p,
     mesh,

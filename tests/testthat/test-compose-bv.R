@@ -88,6 +88,7 @@ test_that("test bv(ar1, ar1) with 2 noise", {
     group = c(rep("A", n / 2), rep("B", n / 2)),
     data = data.frame(Y = Y),
     control_opt = control_opt(
+    warn_no_convergence = FALSE,
       optimizer = precond_sgd(),
       seed = 3,
       iterations = 10,
@@ -130,7 +131,7 @@ test_that("test on bv(matern, matern)", {
     noise = list(A = noise_nig(), B = noise_nig())
   )
 
-  W <- simulate(true_model)[[1]]
+  W <- simulate(true_model, seed = 2)[[1]]
   n_obs <- length(W)
   Y <- W + rnorm(n_obs, sd = 0.5)
   length(Y)
@@ -155,6 +156,7 @@ test_that("test on bv(matern, matern)", {
       n_gibbs_samples = 5
     ),
     control_opt = control_opt(
+    warn_no_convergence = FALSE,
       iterations = 10,
       n_parallel_chain = 4,
       estimation = T,
@@ -225,7 +227,7 @@ test_that("test on bv matern NIG", {
   )
   true_model
 
-  sim_fields <- simulate(true_model)[[1]]
+  sim_fields <- simulate(true_model, seed = 3)[[1]]
 
   sd_1 <- 0.6
   sd_2 <- 0.9
@@ -276,6 +278,7 @@ test_that("test on bv matern NIG", {
     ),
     data = data.frame(Y, long, lat),
     control_opt = control_opt(
+    warn_no_convergence = FALSE,
       iterations = 20,
       n_parallel_chain = 4,
       seed = 50
@@ -314,6 +317,7 @@ test_that("test on bv matern NIG", {
     ),
     data = data.frame(Y, long, lat),
     control_opt = control_opt(
+    warn_no_convergence = FALSE,
       estimation = TRUE,
       iterations = 20,
       print_check_info = FALSE,

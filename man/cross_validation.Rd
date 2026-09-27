@@ -18,11 +18,13 @@ cross_validation(
   percent = 0.2,
   times = 10,
   metric = NULL,
+  transform = identity,
   test_idx = NULL,
   train_idx = NULL,
   keep_pred = FALSE,
   parallel = FALSE,
   thining_gap = 1,
+  max_num_threads = NULL,
   cores_layer1 = if (parallel) min(parallel::detectCores(), 2) else 1,
   cores_layer2 = if (parallel) min(parallel::detectCores(), 2) else 1,
   merge_groups = FALSE,
@@ -40,7 +42,9 @@ loo is leave-one-out,
 lpo is leave-percent-out, provide \code{percent} from 1 to 100
 custom is user-defined group, provide \code{target} and \code{data}}
 
-\item{seed}{random seed}
+\item{seed}{random seed. If \code{NULL} (the default), a seed is drawn
+from the current R random number stream, so \code{set.seed()} makes the
+result reproducible.}
 
 \item{print}{print information during computation}
 
@@ -68,6 +72,9 @@ components \code{samples1}, \code{samples2}, and \code{label}. When
 \code{metric = function(data) 2 * data$y["A"] + data$y["B"]}. To sum all
 groups, return \code{sum(data$y)}.}
 
+\item{transform}{maps each value to a comparison scale, element-wise, applied
+to the observations and to every posterior draw.}
+
 \item{test_idx}{a list of indices of the data (which data points to be predicted) (only for custom type)}
 
 \item{train_idx}{a list of indices of the data (which data points to be used for re-sampling (not re-estimation)) (only for custom type)}
@@ -77,6 +84,11 @@ groups, return \code{sum(data$y)}.}
 \item{parallel}{logical, run in parallel mode}
 
 \item{thining_gap}{integer, the gap between samples for thinning, if 0, then no thinning, if 1, then keep 50\% of the samples for CRPS, sCRPS, etc.}
+
+\item{max_num_threads}{cap on OpenMP threads for the scoring passes. Fitting
+sets this from \code{control_opt}, but scoring does not, so a session that only
+cross-validates inherits one thread per core; several concurrent runs then
+oversubscribe. \code{NULL} (default) leaves the current setting untouched.}
 
 \item{cores_layer1}{integer, number of cores for the first layer (over testing samples)}
 

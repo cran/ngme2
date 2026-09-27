@@ -683,6 +683,99 @@ is_stationary <- function(B) {
   ncol(B) == 1 && all(B == 1)
 }
 
+# classes accepted as a single mesh throughout the package
+NGME_MESH_CLASSES <- c(
+  "inla.mesh.1d", "inla.mesh", "fm_mesh_1d", "fm_mesh_2d", "metric_graph"
+)
+
+is_ngme_mesh <- function(x) {
+  inherits(x, NGME_MESH_CLASSES)
+}
+
+# a list of meshes, i.g. the output of ngme_make_mesh_repls()
+is_ngme_mesh_list <- function(x) {
+  is.list(x) && !is_ngme_mesh(x) && length(x) > 0 &&
+    all(vapply(x, is_ngme_mesh, logical(1)))
+}
+
+# TRUE if `mesh` given to operator `model` means "one mesh per replicate".
+# For tensor product models the mesh argument is itself a list of meshes,
+# so a per-replicate specification is a list of such lists.
+is_replicate_mesh_arg <- function(mesh, model) {
+  if (isTRUE(model %in% c("tp", "spacetime"))) {
+    return(
+      is.list(mesh) && !is_ngme_mesh(mesh) && length(mesh) > 0 &&
+        all(vapply(mesh, is_ngme_mesh_list, logical(1)))
+    )
+  }
+  is_ngme_mesh_list(mesh)
+}
+
+# Resolve the `mesh` argument of the operator supplied to f().
+# `model_expr` is the (unevaluated) `model=` argument of a parsed f() call,
+# e.g. rw1(mesh = mesh_list), matern(mesh_list) or a symbol bound to an
+# ngme_operator_def. Returns NULL when no mesh can be resolved, otherwise a list
+# with the evaluated mesh, the operator name and a setter returning a model
+# argument with the mesh replaced.
+resolve_f_model_mesh <- function(model_expr, data = NULL, enclos = parent.frame()) {
+  if (is.call(model_expr)) {
+    fname <- .call_fun_name(model_expr) # bare name, ngme2:: prefix stripped
+    if (!nzchar(fname)) return(NULL)
+    fn <- tryCatch(
+      get(fname, envir = asNamespace("ngme2"), mode = "function"),
+      error = function(e) NULL
+    )
+    if (is.null(fn)) return(NULL)
+    # match.call() so that a positional mesh, i.g. rw1(mesh_list), is found too
+    matched <- tryCatch(match.call(fn, model_expr), error = function(e) NULL)
+    if (is.null(matched) || is.null(matched[["mesh"]])) return(NULL)
+    mesh <- tryCatch(
+      eval(matched[["mesh"]], envir = data, enclos = enclos),
+      error = function(e) NULL
+    )
+    if (is.null(mesh)) return(NULL)
+    return(list(
+      mesh = mesh,
+      model = fname,
+      set = function(new_mesh) {
+        matched[["mesh"]] <- new_mesh
+        matched
+      }
+    ))
+  }
+
+  # model given as a symbol (or already an object) bound to an operator def
+  obj <- tryCatch(
+    eval(model_expr, envir = data, enclos = enclos),
+    error = function(e) NULL
+  )
+  if (!inherits(obj, "ngme_operator_def") || is.null(obj$args$mesh)) return(NULL)
+  list(
+    mesh = obj$args$mesh,
+    model = obj$model,
+    set = function(new_mesh) {
+      obj$args$mesh <- new_mesh
+      obj
+    }
+  )
+}
+
+# pick the mesh of one replicate out of a per-replicate mesh list
+select_replicate_mesh <- function(mesh_list, level, level_idx, field_name = "") {
+  nms <- names(mesh_list)
+  if (!is.null(nms) && as.character(level) %in% nms) {
+    return(mesh_list[[as.character(level)]])
+  }
+  if (level_idx > length(mesh_list)) {
+    stop(
+      "Not enough meshes provided for field '", field_name, "' at replicate ",
+      level, ". Expected at least ", level_idx, " meshes, but only ",
+      length(mesh_list), " provided."
+    )
+  }
+  mesh_list[[level_idx]]
+}
+
 
 #' @title ngme make mesh for different replicates
 #' @description
@@ -710,21 +803,27 @@ ngme_make_mesh_repls <- function(
 
   stopifnot(length_map(map) == length(replicate))
 
-  mesh_repls <- NULL
-  for (repl in replicate) {
-    map_repl <- subset(map, replicate == repl)
+  if (!dim_map(map) %in% c(1, 2)) {
+    stop("The dimension of the mesh should be 1 or 2.")
+  }
+
+  # one mesh per replicate level, in the same order as levels(as.factor())
+  # used by ngme() to split the data
+  repl_levels <- levels(as.factor(replicate))
+
+  mesh_repls <- list()
+  for (repl in repl_levels) {
+    map_repl <- sub_map(map, as.character(replicate) == repl)
     if (dim_map(map) == 1) {
-      mesh_repls[[as.character(repl)]] <- tryCatch(
+      mesh_repls[[repl]] <- tryCatch(
         fmesher::fm_mesh_1d(map_repl),
         error = function(e) {
           stop("The nodes for making mesh is not valid for replicate id=", repl)
         }
       )
-    } else if (dim_map(map) == 2) {
+    } else {
       stop("Not implemented yet.")
       mesh_repls[[repl]] <- fmesher::fm_mesh_2d(map_repl)
-    } else {
-      stop("The dimension of the mesh should be 1 or 2.")
     }
   }
 
@@ -1190,13 +1289,9 @@ get_data_from_formula <- function(form, data) {
   return(X)
 }
 
-#' Check whether a newer stable version of ngme2 is available
+#' Update ngme2 to the latest stable version
 #'
-#' This function checks the package repository for the latest available ngme2
-#' version. It does not install or update packages.
-#'
-#' @return Invisibly returns a list with the local version, remote version,
-#'   repository URL, and a logical \code{update_available} flag.
+#' @return void
 #' @export
 ngme_update <- function() {
   local_version <- utils::packageVersion("ngme2")
@@ -1210,30 +1305,18 @@ ngme_update <- function() {
 
   if (is.null(available) || !"ngme2" %in% rownames(available)) {
     message("Could not check for updates. Please check your internet connection or the repository URL.")
-    return(invisible(list(
-      local_version = as.character(local_version),
-      remote_version = NA_character_,
-      repository = repos,
-      update_available = NA
-    )))
+    return(invisible(NULL))
   }
 
   remote_version <- available["ngme2", "Version"]
-  update_available <- utils::compareVersion(as.character(remote_version), as.character(local_version)) > 0
 
-  if (update_available) {
+  if (utils::compareVersion(as.character(remote_version), as.character(local_version)) > 0) {
     message(paste0("New stable version available: ", remote_version, " (local: ", local_version, ")"))
-    message("Install it manually from repository: ", repos)
+    message("Installing...")
+    utils::install.packages("ngme2", repos = repos)
   } else {
     message(paste0("ngme2 is up to date (version ", local_version, ")"))
   }
-
-  invisible(list(
-    local_version = as.character(local_version),
-    remote_version = as.character(remote_version),
-    repository = repos,
-    update_available = update_available
-  ))
 }
 
 
@@ -1256,4 +1339,70 @@ openmp_test <- function() {
     message("OpenMP is available, the default thread number is ", num_threads, ".")
   }
   invisible(num_threads)
+}
+
+# Draw a seed from the ambient R random number stream.
+#
+# Used as the fallback whenever the user does not supply a seed, so that
+# set.seed() controls ngme2's simulation and sampling in the usual R way.
+# The upper bound leaves room for the offsets that callers add to the seed
+# (e.g. seed + 2000, or seed + nn inside an nsim loop) before handing it to
+# set.seed() or to the C++ backend, both of which need a valid integer.
+ngme_random_seed <- function() {
+  sample.int(.Machine$integer.max %/% 2L, 1L)
+}
+
+# Warn about ARMA(p, q) latent fields whose parameters are not identifiable.
+#
+# Observed under independent Gaussian measurement noise, a Gaussian latent
+# ARMA(p, q) is second-order equivalent to an ARMA(p, max(p, q)): writing
+# (1 - sum rho_j B^j) y = (1 + sum phi_k B^k) eps + (1 - sum rho_j B^j) e, the
+# right hand side is an MA(max(p, q)). The likelihood therefore depends on only
+# p + max(p, q) + 1 quantities while the model carries p + q + 2 free
+# parameters, so for q >= p exactly one direction is flat: the latent sigma
+# trades against the measurement sigma with the MA coefficients absorbing the
+# difference, at identical likelihood. Estimates of the individual parameters
+# are then arbitrary along that ridge even though the fitted process is right.
+#
+# Non-Gaussian latent or measurement noise pins the ridge down through the
+# higher moments, and fixing either sigma (or the MA coefficients) removes the
+# free direction, so none of those cases warn.
+arma_gaussian_ridge <- function(latent, meas_noise) {
+  op <- latent$operator
+  if (is.null(op) || !identical(op$model, "arma")) return(FALSE)
+
+  p <- op$p; q <- op$q
+  if (is.null(p) || is.null(q) || q < p) return(FALSE)
+
+  if (!identical(latent$noise$noise_type, "normal")) return(FALSE)
+  if (!identical(meas_noise$noise_type, "normal")) return(FALSE)
+
+  # Any of these being fixed makes the remaining parameters identifiable.
+  if (q > 0 && length(op$fix_phi) > 0 && all(op$fix_phi)) return(FALSE)
+  if (all(latent$noise$fix_theta_sigma)) return(FALSE)
+  if (all(meas_noise$fix_theta_sigma)) return(FALSE)
+
+  TRUE
+}
+
+check_arma_identifiable <- function(ngme_model) {
+  repl <- ngme_model$replicates[[1]]
+  for (latent in repl$models) {
+    if (!arma_gaussian_ridge(latent, repl$noise)) next
+    p <- latent$operator$p; q <- latent$operator$q
+    warning(
+      "f(", latent$name, "): a Gaussian ARMA(", p, ", ", q, ") field observed ",
+      "under Gaussian measurement noise is not identifiable. The observed ",
+      "process is second-order equivalent to an ARMA(", p, ", ", max(p, q),
+      "), so the latent 'sigma', the MA coefficients and the measurement ",
+      "'sigma' are determined only up to a one-dimensional ridge along which ",
+      "the likelihood is exactly flat -- predictions are fine, but the ",
+      "individual parameter estimates are not meaningful. Use ar_order > ",
+      "ma_order, fix one of the scales (e.g. noise = noise_normal(",
+      "fix_theta_sigma = TRUE) for the measurement noise, or fix_ma = TRUE in ",
+      "arma()), or use non-Gaussian noise.",
+      call. = FALSE
+    )
+  }
+  invisible(NULL)
 }
