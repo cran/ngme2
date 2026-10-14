@@ -1,7 +1,7 @@
 Package: ngme2
 Type: Package
 Title: Linear Latent Non-Gaussian Models with Flexible Distributions
-Version: 1.0.0
+Version: 1.0.1
 Authors@R: c(
     person("David", "Bolin", email = "davidbolin@gmail.com", role = c("aut", "cph")),
     person("Xiaotian", "Jin", email = "xiaotian.jin@kaust.edu.sa", role =c("aut", "cre")),
@@ -43,7 +43,7 @@ Encoding: UTF-8
 LazyData: true
 Imports: Matrix, Rcpp, methods, rlang, ggplot2, graphics, fmesher,
         stats, gridExtra, withr
-LinkingTo: Rcpp, RcppEigen,
+LinkingTo: Matrix, Rcpp, RcppEigen
 Suggests: knitr, rmarkdown, INLA, RcppEigen, sf, inlabru, dplyr, plyr,
         MASS, grid, testthat (>= 3.0.0), xml2, splancs, lattice,
         viridis, rSPDE, tidyr, fields, lme4, plotly, usethis, devtools,
@@ -64,7 +64,7 @@ Copyright: The R package and code, and the main programs, were written
         inst/COPYRIGHTS.
 Config/roxygen2/version: 8.1.0
 NeedsCompilation: yes
-Packaged: 2026-09-26 05:03:25 UTC; jinx
+Packaged: 2026-10-13 09:26:38 UTC; runner
 Author: David Bolin [aut, cph],
   Xiaotian Jin [aut, cre],
   Alexandre Simas [aut],
@@ -91,4 +91,4 @@ Author: David Bolin [aut, cph],
   Alexander Chemeris [ctb, cph] (MS integer headers bundled with
     SuiteSparse)
 Repository: CRAN
-Date/Publication: 2026-09-27 09:00:02 UTC
+Date/Publication: 2026-10-14 06:40:18 UTC
